@@ -1,53 +1,34 @@
-﻿<#
+<#
 .SYNOPSIS
-    Consolidated Kerberos RC4 assessment for Active Directory.
+    Collects and consolidates Kerberos RC4 usage evidence across all selected Domain Controllers.
 
 .DESCRIPTION
-    Correlates the same Kerberos telemetry used by Microsoft's official:
-      - Get-KerbEncryptionUsage.ps1
-      - List-AccountKeys.ps1
-
-    IMPORTANT CORRELATION RULES:
-      1) Event 4769 represents a TGS request.
-         - Source/requestor = Properties[0]
-         - Target service account = Properties[2]
-         - Ticket encryption = Properties[5]
-         - Session key encryption = Properties[20]
-         - Available account keys = Properties[16]
-         Microsoft's List-AccountKeys.ps1 assigns Properties[16] to the TARGET
-         service account, not to the requestor.
-
-      2) Event 4768 represents an AS request.
-         - Source account = Properties[0]
-         - Target = Properties[3] (normally krbtgt)
-         - Ticket encryption = Properties[7]
-         - Session key encryption = Properties[22]
-         - Available account keys = Properties[16]
-         Microsoft's List-AccountKeys.ps1 assigns Properties[16] to the SOURCE
-         account for 4768.
-
-      3) RC4 in a 4769 service ticket is attributed to the TARGET service account.
-         The requestor is retained as evidence/context but is NOT automatically
-         classified as an RC4-dependent account.
-
-      4) v1.7 additionally reads ClientAdvertizedEncryptionTypes from the event XML.
-         For 4769, Advertized Etypes are stored as REQUESTER/CLIENT context on the
-         TARGET service account row. v1.7 also preserves requester-to-advertised-
-         etype correlation so a legacy client can be identified directly.
-         Advertised Etypes do not independently prove RC4 usage and do not change
-         the account severity model.
-
-      5) KDCSVC System events 201-209 are collected as supplementary Microsoft
-         enforcement-readiness evidence. They are reported separately and do not
-         override Security 4768/4769 account attribution or severity.
-
-    The script is read-only. It does not change AD, SPNs, GPOs, passwords, registry,
-    or Kerberos policy.
+    This single-file assessment extends the Microsoft Kerberos-Crypto approach by collecting
+    Security Events 4768 and 4769 from mixed-generation Domain Controllers, including legacy
+    and enhanced event schemas. It correlates event telemetry with Active Directory attributes
+    and generates a concise HTML report, a CSV export, and a separate KDCSVC 201-209 readiness CSV.
 
 .NOTES
-	Author  : Igor Henrique Martini
+    Author  : Igor Henrique Martini
     Website : https://igormartini.cloud
-    Microsoft reference repository: https://github.com/microsoft/Kerberos-Crypto
+    Version: 5.1 Final
+    Target execution platform: Windows 10 or Windows 11 with Windows PowerShell 5.1
+    Supported Domain Controller event sources: Windows Server 2008 R2 through Windows Server 2025+
+
+.DISCLAIMER
+    Severity labels are an operational prioritization model created for this tool. They are not
+    official Microsoft severity ratings. Validate all remediation actions in a controlled environment
+    before making production changes.
+
+.ASSESSMENT WORKFLOW
+    1. Collect Security Events 4768 and 4769.
+    2. Collect KDCSVC Events 201 through 209.
+    3. Read Active Directory account attributes.
+    4. Normalize and correlate evidence across all selected Domain Controllers.
+    5. Generate the consolidated HTML report.
+    6. Generate the consolidated CSV report.
+    7. Generate the KDCSVC readiness CSV report.
+
 #>
 
 [CmdletBinding()]
@@ -64,15 +45,117 @@ $OutputPath  = Join-Path $PSScriptRoot 'KerberosRC4-Assessment'
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Writes a standardized progress message to the console.
 function Write-Step([string]$Message) {
     Write-Host "[+] $Message" -ForegroundColor Cyan
 }
 
+# Escapes text before inserting it into HTML.
 function Convert-HtmlSafe {
     param([AllowNull()][object]$Value)
     if ($null -eq $Value) { return '' }
     [System.Net.WebUtility]::HtmlEncode([string]$Value)
 }
+
+# Implements the Normalize-PrincipalName helper used by the Kerberos assessment workflow.#
+
+# Renders delimited values as one complete HTML record per line.
+function Convert-ToHtmlRecordLines {
+    param(
+        [AllowNull()][string]$Value,
+        [string]$Separator = ';'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return '—'
+    }
+
+    $items = @(
+        $Value -split [regex]::Escape($Separator) |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($items.Count -eq 0) {
+        return '—'
+    }
+
+    return (
+        $items |
+        ForEach-Object {
+            "<div class='record-line'>$(Convert-HtmlSafe $_)</div>"
+        }
+    ) -join ''
+}
+
+
+# Normalizes principal names for cross-DC correlation.
+
+# Renders semicolon-separated encryption values as stacked visual tags.
+function Convert-ToHtmlEncryptionTags {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return '—'
+    }
+
+    $items = @(
+        $Value -split ';' |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($items.Count -eq 0) {
+        return '—'
+    }
+
+    return (
+        $items |
+        ForEach-Object {
+            $safe = Convert-HtmlSafe $_
+            $class = if ($_ -match '^RC4') {
+                'crypto-tag crypto-rc4'
+            }
+            elseif ($_ -match '^AES') {
+                'crypto-tag crypto-aes'
+            }
+            elseif ($_ -match '^DES') {
+                'crypto-tag crypto-des'
+            }
+            else {
+                'crypto-tag'
+            }
+
+            "<div class='crypto-line'><span class='$class'>$safe</span></div>"
+        }
+    ) -join ''
+}
+
+# Renders requester-to-etype mappings as requester blocks with one etype per line.
+function Convert-ToHtmlRequesterEtypeMap {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return '—'
+    }
+
+    $records = @(
+        $Value -split '\s+\|\s+' |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    $html = foreach ($record in $records) {
+        $parts = $record -split ':', 2
+        $requester = Convert-HtmlSafe $parts[0].Trim()
+        $etypeText = if ($parts.Count -gt 1) { $parts[1].Trim().Replace(',', ';') } else { '' }
+
+        "<div class='requester-block'><div class='requester-name'>$requester</div>$(Convert-ToHtmlEncryptionTags $etypeText)</div>"
+    }
+
+    return $html -join ''
+}
+
 
 function Normalize-PrincipalName {
     param([AllowNull()][string]$Name)
@@ -83,12 +166,19 @@ function Normalize-PrincipalName {
     $n.Trim()
 }
 
+# Implements the Convert-EType helper.
 function Convert-EType {
     param([AllowNull()][object]$Value)
 
     if ($null -eq $Value) { return '' }
     $s = ([string]$Value).Trim()
     if (-not $s) { return '' }
+
+    # 0xFFFFFFFF is logged when no Kerberos ticket was issued, typically in
+    # authentication-failure events. It is a result state, not an encryption type.
+    if ($s -match '^(?i)0xFFFFFFFF$' -or $s -eq '-1' -or $s -eq '4294967295') {
+        return 'No Ticket Issued'
+    }
 
     # Event XML normally returns hex strings, Properties[] can return integers.
     $numeric = $null
@@ -108,6 +198,7 @@ function Convert-EType {
             0x14 { return 'AES256-SHA384' }
             0x17 { return 'RC4' }
             0x18 { return 'RC4-EXP' }
+            -1   { return 'No Ticket Issued' }
             default { return ('0x{0:X}' -f $numeric) }
         }
     }
@@ -124,14 +215,17 @@ function Convert-EType {
     }
 }
 
+# Implements the Test-IsRC4 helper.
 function Test-IsRC4([AllowNull()][object]$Value) {
     (Convert-EType $Value) -in @('RC4','RC4-EXP')
 }
 
+# Implements the Test-IsAES helper.
 function Test-IsAES([AllowNull()][object]$Value) {
     (Convert-EType $Value) -in @('AES128-SHA96','AES256-SHA96','AES128-SHA256','AES256-SHA384','AES-SHA1')
 }
 
+# Implements the Split-AvailableKeys helper.
 function Split-AvailableKeys {
     param([AllowNull()][object]$Raw)
 
@@ -155,6 +249,7 @@ function Split-AvailableKeys {
     @($out | Sort-Object -Unique)
 }
 
+# Implements the Convert-SupportedEncryptionTypes helper.
 function Convert-SupportedEncryptionTypes {
     param([AllowNull()][object]$Raw)
 
@@ -184,38 +279,7 @@ function Convert-SupportedEncryptionTypes {
 }
 
 
-function Get-EventDataMap {
-    param([System.Diagnostics.Eventing.Reader.EventRecord]$Event)
-
-    $map = @{}
-    try {
-        [xml]$xml = $Event.ToXml()
-        foreach ($d in @($xml.Event.EventData.Data)) {
-            $name = [string]$d.Name
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-                $map[$name] = [string]$d.InnerText
-            }
-        }
-    } catch {}
-    $map
-}
-
-function Get-EventDataValue {
-    param(
-        [hashtable]$Map,
-        [string[]]$Names
-    )
-    foreach ($name in $Names) {
-        if ($Map.ContainsKey($name)) {
-            $value = [string]$Map[$name]
-            if (-not [string]::IsNullOrWhiteSpace($value) -and $value -ne '-') {
-                return $value
-            }
-        }
-    }
-    return $null
-}
-
+# Implements the Split-AdvertizedEtypes helper.
 function Split-AdvertizedEtypes {
     param([AllowNull()][object]$Raw)
 
@@ -248,6 +312,7 @@ function Split-AdvertizedEtypes {
     @($out | Sort-Object -Unique)
 }
 
+# Implements the Add-AdvertizedEtypesEvidence helper.
 function Add-AdvertizedEtypesEvidence {
     param($State,[AllowNull()][object]$Raw)
 
@@ -274,6 +339,7 @@ function Add-AdvertizedEtypesEvidence {
     }
 }
 
+# Implements the Get-ClientAESSupport helper.
 function Get-ClientAESSupport {
     param($State)
 
@@ -287,6 +353,7 @@ function Get-ClientAESSupport {
     return 'No'
 }
 
+# Implements the Add-RequesterAdvertizedEvidence helper.
 function Add-RequesterAdvertizedEvidence {
     param($State,[AllowNull()][string]$Requester,[AllowNull()][object]$Raw)
 
@@ -309,6 +376,7 @@ function Add-RequesterAdvertizedEvidence {
     }
 }
 
+# Implements the Format-RequesterAdvertizedEvidence helper.
 function Format-RequesterAdvertizedEvidence {
     param($State)
     if ($null -eq $State -or $State.RequesterAdvertizedMap.Count -eq 0) { return '' }
@@ -323,17 +391,73 @@ function Format-RequesterAdvertizedEvidence {
     ) -join ' | '
 }
 
+
+# Implements the Add-CountMapValue helper.
+function Add-CountMapValue {
+    param([hashtable]$Map,[string]$Key,[int]$Increment=1)
+    if ($null -eq $Map -or [string]::IsNullOrWhiteSpace($Key)) { return }
+    if (-not $Map.ContainsKey($Key)) { $Map[$Key] = 0 }
+    $Map[$Key] = [int]$Map[$Key] + $Increment
+}
+
+# Implements the Add-SetMapValue helper.
+function Add-SetMapValue {
+    param([hashtable]$Map,[string]$Key,[string]$Value)
+    if ($null -eq $Map -or [string]::IsNullOrWhiteSpace($Key) -or [string]::IsNullOrWhiteSpace($Value)) { return }
+    if (-not $Map.ContainsKey($Key)) {
+        $Map[$Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    [void]$Map[$Key].Add($Value)
+}
+
+# Formats correlation counters for display.
+function Format-CountMap {
+    param([hashtable]$Map)
+    if ($null -eq $Map -or $Map.Count -eq 0) { return '' }
+    @(
+        $Map.GetEnumerator() |
+        Sort-Object Name |
+        ForEach-Object { "$($_.Name): $($_.Value)" }
+    ) -join ' | '
+}
+
+# Formats correlation sets for display.
+function Format-SetMap {
+    param([hashtable]$Map)
+    if ($null -eq $Map -or $Map.Count -eq 0) { return '' }
+    @(
+        $Map.GetEnumerator() |
+        Sort-Object Name |
+        ForEach-Object {
+            $values = @($_.Value | Sort-Object) -join ', '
+            "$($_.Name): $values"
+        }
+    ) -join ' | '
+}
+
+# Implements the New-PrincipalState helper.
 function New-PrincipalState {
     param([string]$Name)
-    [ordered]@{
+    [pscustomobject][ordered]@{
         Name=$Name
         FirstSeen=$null
         LastSeen=$null
         EventCount=0
+        ModernSchemaEvents=0
+        LegacySchemaEvents=0
+        CollectorModes=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        RemotePSVersions=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-        # Account-key evidence (Microsoft List-AccountKeys semantics)
+        # Account-key evidence (Microsoft List-AccountKeys semantics).
+        # The union is retained for reporting, while per-event counters are used
+        # to prevent a false RC4-only conclusion when evidence conflicts.
         AvailableKeys=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         KeyEvidenceEvents=0
+        RC4OnlyKeyEvidenceEvents=0
+        AESKeyEvidenceEvents=0
+        OtherKeyEvidenceEvents=0
+        KeyEvidenceByDC=@{}
+        KeyEvidenceRecordIdsByDC=@{}
 
         # Actual usage attributed to this account as TARGET service / AS account.
         TicketTypes=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -361,42 +485,131 @@ function New-PrincipalState {
         TargetPrincipals=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         DomainControllers=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         EvidenceRecordIds=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+        # Per-DC evidence origin retained for auditability.
+        EventCountByDC=@{}
+        RC4TgsCountByDC=@{}
+        RC4AsCountByDC=@{}
+        AESTicketCountByDC=@{}
+        AESSessionCountByDC=@{}
+        TicketTypesByDC=@{}
+        SessionTypesByDC=@{}
     }
 }
 
+# Implements the Get-OrCreateState helper.
 function Get-OrCreateState {
     param([hashtable]$States,[string]$Name)
     $n = Normalize-PrincipalName $Name
     if (-not $n -or $n -eq '-') { return $null }
     $key = $n.ToLowerInvariant()
     if (-not $States.ContainsKey($key)) {
-        $States[$key] = New-PrincipalState $n
+        # Suppress assignment output. Without [void], PowerShell emits the newly
+        # assigned state and then emits it again on the return line below,
+        # causing the caller to receive Object[] instead of one state object.
+        [void]($States[$key] = New-PrincipalState $n)
     }
-    $States[$key]
+    return $States[$key]
 }
 
+# Implements the Touch-State helper.
 function Touch-State {
     param($State,[datetime]$Time,[string]$DC,[long]$RecordId)
     if ($null -eq $State) { return }
     $State.EventCount++
     if ($null -eq $State.FirstSeen -or $Time -lt $State.FirstSeen) { $State.FirstSeen=$Time }
     if ($null -eq $State.LastSeen -or $Time -gt $State.LastSeen) { $State.LastSeen=$Time }
-    if ($DC) { [void]$State.DomainControllers.Add($DC) }
+    if ($DC) {
+        [void]$State.DomainControllers.Add($DC)
+        Add-CountMapValue $State.EventCountByDC $DC 1
+    }
     [void]$State.EvidenceRecordIds.Add([string]$RecordId)
 }
 
-function Add-KeyEvidence {
-    param($State,[object]$RawKeys)
+# Tracks collector details for a principal.
+function Add-CollectorEvidence {
+    param(
+        $State,
+        [AllowNull()][string]$CollectorMode,
+        [AllowNull()][string]$RemotePSVersion
+    )
+
     if ($null -eq $State) { return }
-    $keys = Split-AvailableKeys $RawKeys
-    if ($keys.Count -gt 0) {
-        $State.KeyEvidenceEvents++
-        foreach ($k in $keys) { [void]$State.AvailableKeys.Add($k) }
+
+    if (-not [string]::IsNullOrWhiteSpace($CollectorMode)) {
+        [void]$State.CollectorModes.Add($CollectorMode)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RemotePSVersion)) {
+        [void]$State.RemotePSVersions.Add($RemotePSVersion)
     }
 }
 
+# Tracks legacy or enhanced event-schema evidence.
+function Add-SchemaEvidence {
+    param($State,[bool]$IsModern)
+    if ($null -eq $State) { return }
+    if ($IsModern) { $State.ModernSchemaEvents++ } else { $State.LegacySchemaEvents++ }
+}
+
+# Determines whether evidence is legacy, modern, or hybrid.
+function Get-AssessmentMode {
+    param($State)
+    if ($null -eq $State) { return 'Unknown' }
+    if ($State.ModernSchemaEvents -gt 0 -and $State.LegacySchemaEvents -gt 0) { return 'Hybrid' }
+    if ($State.ModernSchemaEvents -gt 0) { return 'Modern' }
+    if ($State.LegacySchemaEvents -gt 0) { return 'Legacy' }
+    return 'Unknown'
+}
+
+# Implements the Add-KeyEvidence helper.
+function Add-KeyEvidence {
+    param(
+        $State,
+        [object]$RawKeys,
+        [string]$DC,
+        [long]$RecordId
+    )
+
+    if ($null -eq $State) { return }
+
+    $keys = @(Split-AvailableKeys $RawKeys)
+    if ($keys.Count -eq 0) { return }
+
+    $State.KeyEvidenceEvents++
+
+    $eventHasAES = @($keys | Where-Object { Test-IsAES $_ }).Count -gt 0
+    $eventHasRC4 = @($keys | Where-Object { Test-IsRC4 $_ }).Count -gt 0
+
+    if ($eventHasAES) {
+        $State.AESKeyEvidenceEvents++
+    }
+    elseif ($eventHasRC4) {
+        $State.RC4OnlyKeyEvidenceEvents++
+    }
+    else {
+        $State.OtherKeyEvidenceEvents++
+    }
+
+    foreach ($key in $keys) {
+        [void]$State.AvailableKeys.Add($key)
+        if ($DC) { Add-SetMapValue $State.KeyEvidenceByDC $DC $key }
+    }
+
+    if ($DC) {
+        Add-SetMapValue $State.KeyEvidenceRecordIdsByDC $DC ([string]$RecordId)
+    }
+}
+
+# Implements the Add-TargetUsage helper.
 function Add-TargetUsage {
-    param($State,[object]$Ticket,[object]$Session,[ValidateSet('AS','TGS')][string]$Type)
+    param(
+        $State,
+        [object]$Ticket,
+        [object]$Session,
+        [ValidateSet('AS','TGS')][string]$Type,
+        [string]$DC
+    )
     if ($null -eq $State) { return }
 
     $t = Convert-EType $Ticket
@@ -404,18 +617,36 @@ function Add-TargetUsage {
 
     if ($t) {
         [void]$State.TicketTypes.Add($t)
+        if ($DC) { Add-SetMapValue $State.TicketTypesByDC $DC $t }
+
         if (Test-IsRC4 $t) {
-            if ($Type -eq 'TGS') { $State.RC4TgsTargetCount++ } else { $State.RC4AsCount++ }
+            if ($Type -eq 'TGS') {
+                $State.RC4TgsTargetCount++
+                if ($DC) { Add-CountMapValue $State.RC4TgsCountByDC $DC 1 }
+            }
+            else {
+                $State.RC4AsCount++
+                if ($DC) { Add-CountMapValue $State.RC4AsCountByDC $DC 1 }
+            }
         }
-        if (Test-IsAES $t) { $State.AESTicketCount++ }
+
+        if (Test-IsAES $t) {
+            $State.AESTicketCount++
+            if ($DC) { Add-CountMapValue $State.AESTicketCountByDC $DC 1 }
+        }
     }
 
     if ($sk) {
         [void]$State.SessionKeyTypes.Add($sk)
-        if (Test-IsAES $sk) { $State.AESSessionCount++ }
+        if ($DC) { Add-SetMapValue $State.SessionTypesByDC $DC $sk }
+        if (Test-IsAES $sk) {
+            $State.AESSessionCount++
+            if ($DC) { Add-CountMapValue $State.AESSessionCountByDC $DC 1 }
+        }
     }
 }
 
+# Implements the Add-RequesterContext helper.
 function Add-RequesterContext {
     param($State,[object]$Ticket,[object]$Session,[string]$Target,[string]$Ip)
     if ($null -eq $State) { return }
@@ -428,6 +659,7 @@ function Add-RequesterContext {
     if ($Ip) { [void]$State.RequesterAddresses.Add($Ip) }
 }
 
+# Implements the Get-ADPrincipal helper.
 function Get-ADPrincipal {
     param([string]$Name)
 
@@ -440,104 +672,63 @@ function Get-ADPrincipal {
     } catch { $null }
 }
 
+# Assigns severity, finding, and recommendation.
 function Get-Classification {
     param(
         [bool]$RC4TgsObserved,
         [bool]$RC4AsObserved,
+        [bool]$AESTicketObserved,
+        [bool]$AESSessionObserved,
         [bool]$HasAESKeyEvidence,
-        [bool]$HasRC4KeyEvidence,
         [bool]$ExplicitRC4,
-        [bool]$ExplicitAES,
-        [bool]$HasSPN,
-        [string]$ObjectClass,
-        [bool]$HasKeyTelemetry
+        [bool]$ExplicitAES
     )
 
-    # FINAL MODEL:
-    # Actual RC4 usage has priority. For modern 4768/4769 telemetry, Available Keys
-    # is used to distinguish "RC4 used but AES keys exist" from "RC4 used and AES
-    # keys are not demonstrated". The AD msDS-SET attribute remains important
-    # configuration evidence, but it does not override observed Available Keys.
-    #
-    # Microsoft notes that event-log msDS-SET/Available Keys are processed values
-    # and that RC4 can be displayed regardless of actual RC4 usage.
+    $observedRC4 = $RC4TgsObserved -or $RC4AsObserved
+    $hasAESEvidence = $AESTicketObserved -or $AESSessionObserved -or $HasAESKeyEvidence -or $ExplicitAES
 
-    if ($RC4TgsObserved) {
-        if ($HasKeyTelemetry -and $HasAESKeyEvidence) {
-            return [pscustomobject]@{
-                Severity='High'; NeedsAction=$true
-                Finding='RC4 service ticket observed for the target account, while AES key capability is also present.'
-                Recommendation='RC4 is actively being used even though AES keys are available. Investigate the target service account, SPN, client Advertized Etypes, Kerberos policy, and application compatibility. Validate AES end-to-end and confirm subsequent 4769 service tickets use AES before removing RC4.'
-            }
+    if ($observedRC4) {
+        $finding = if ($RC4TgsObserved -and $RC4AsObserved) {
+            'Events 4768 and 4769: RC4 observed.'
         }
-
-        if ($HasKeyTelemetry -and -not $HasAESKeyEvidence) {
-            return [pscustomobject]@{
-                Severity='Critical'; NeedsAction=$true
-                Finding='RC4 service ticket observed and modern event telemetry does not demonstrate AES keys for the target account.'
-                Recommendation='Treat this as an active RC4-only or missing-AES-key dependency. Validate application support, generate AES keys where appropriate (often by rotating/resetting the service-account password), configure AES support, test the service, and confirm subsequent 4769 tickets use AES.'
-            }
+        elseif ($RC4TgsObserved) {
+            'Event 4769: RC4 service ticket observed.'
+        }
+        else {
+            'Event 4768: RC4 authentication activity observed.'
         }
 
         return [pscustomobject]@{
-            Severity='High'; NeedsAction=$true
-            Finding='RC4 service ticket observed, but modern Available Keys telemetry is not available to determine whether AES keys exist.'
-            Recommendation='Investigate the active RC4 dependency. Review the target account, SPN, client Advertized Etypes and Kerberos configuration. Obtain modern 4769 telemetry where possible to determine AES key availability before remediation.'
+            Severity='High'
+            NeedsAction=$true
+            Finding=$finding
+            Recommendation='Investigate the accounts, services, and requesting systems still using RC4. Confirm AES support, update the account or device configuration where appropriate, re-audit Events 4768/4769, and remove RC4 only after successful compatibility testing.'
         }
     }
 
-    if ($RC4AsObserved) {
-        if ($HasKeyTelemetry -and -not $HasAESKeyEvidence) {
-            return [pscustomobject]@{
-                Severity='Critical'; NeedsAction=$true
-                Finding='RC4 was observed during AS authentication and modern event telemetry does not demonstrate AES keys for this account.'
-                Recommendation='Review the account and client Kerberos configuration. Generate AES keys where appropriate, update legacy dependencies, and confirm subsequent AS authentication uses AES.'
-            }
-        }
-
+    if ($ExplicitRC4) {
         return [pscustomobject]@{
-            Severity='High'; NeedsAction=$true
-            Finding='RC4 was observed during AS authentication for this account.'
-            Recommendation='Review the account and client Kerberos configuration, verify AES support and client Advertized Etypes, update legacy dependencies, and confirm subsequent AS authentication uses AES.'
+            Severity='Medium'
+            NeedsAction=$true
+            Finding='AD attribute: msDS-SupportedEncryptionTypes allows RC4; no RC4 activity was observed in the selected window.'
+            Recommendation='Validate that the account, service, and requesting clients operate with AES. After testing, remove the RC4 bit from msDS-SupportedEncryptionTypes while retaining the required AES types, then monitor Events 4768/4769 for failures.'
         }
     }
 
-    if ($ObjectClass -ne 'computer' -and $HasSPN -and $ExplicitRC4) {
+    if ($hasAESEvidence) {
         return [pscustomobject]@{
-            Severity='Medium'; NeedsAction=$true
-            Finding='RC4 is explicitly allowed on a non-computer account that owns SPNs, but no RC4 service-ticket usage was observed.'
-            Recommendation='Review whether RC4 is still required for this service account. Since no RC4 use was observed, validate AES operation first and remove explicit RC4 only after compatibility testing.'
-        }
-    }
-
-    if ($ObjectClass -eq 'computer' -and $ExplicitRC4 -and $ExplicitAES) {
-        return [pscustomobject]@{
-            Severity='Informational'; NeedsAction=$false
-            Finding='RC4 is present in the computer account configuration, but AES is enabled and no RC4 service-ticket usage was observed.'
-            Recommendation='No immediate remediation is required based on observed usage. Continue monitoring; treat this as RC4 capability/configuration rather than an active dependency.'
-        }
-    }
-
-    if ($ExplicitAES -and -not $ExplicitRC4) {
-        return [pscustomobject]@{
-            Severity='Healthy'; NeedsAction=$false
-            Finding='The account is explicitly configured for AES and no RC4 usage was observed.'
-            Recommendation='No remediation identified. Continue periodic Kerberos monitoring.'
-        }
-    }
-
-    if ($HasAESKeyEvidence -and -not $RC4TgsObserved -and -not $RC4AsObserved) {
-        return [pscustomobject]@{
-            Severity='Informational'; NeedsAction=$false
-            Finding='AES key capability was observed and no RC4 usage was attributed to this account.'
-            Recommendation='No immediate remediation identified from the observed Kerberos activity. Continue monitoring.'
+            Severity='Healthy'
+            NeedsAction=$false
+            Finding='Events or account evidence show AES capability or usage; no RC4 activity was observed in the selected window.'
+            Recommendation='No RC4 remediation is currently required. Continue periodic monitoring to confirm that Kerberos authentication remains on AES.'
         }
     }
 
     return [pscustomobject]@{
-        Severity='Review'; NeedsAction=$true
-        Finding='The available telemetry is insufficient to classify this account confidently.'
-        Recommendation='Review recent 4768/4769 evidence, Advertized Etypes, and the account encryption configuration manually.'
+        Severity='Informational'
+        NeedsAction=$false
+        Finding='No RC4 activity was observed, but the available event and account evidence is insufficient for a stronger conclusion.'
+        Recommendation='Continue monitoring Events 4768/4769 and review Available Keys and msDS-SupportedEncryptionTypes when additional validation is required.'
     }
 }
 
@@ -546,17 +737,18 @@ Import-Module ActiveDirectory -ErrorAction Stop
 
 $domain = Get-ADDomain
 $forest = Get-ADForest
-$since = (Get-Date).AddDays(-$Days)
+$collectionEnd = Get-Date
+$since = $collectionEnd.AddDays(-$Days)
 
 if (-not (Test-Path $OutputPath)) {
     New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
 }
 
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$stamp = $collectionEnd.ToString('yyyyMMdd_HHmmss')
 $htmlPath = Join-Path $OutputPath "Kerberos_RC4_Assessment_$stamp.html"
 $csvPath = Join-Path $OutputPath "Kerberos_RC4_Assessment_$stamp.csv"
 $kdcCsvPath = Join-Path $OutputPath "Kerberos_RC4_KDCSVC_201-209_$stamp.csv"
-$generatedAt = Get-Date
+$generatedAt = $collectionEnd
 try { $runAs = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { $runAs = "$env:USERDOMAIN\$env:USERNAME" }
 
 if ($SearchScope -eq 'AllKdcs') {
@@ -582,80 +774,353 @@ foreach ($dc in $dcs) {
     $dcName = [string]$dc.HostName
     Write-Step "Reading 4768/4769 from $dcName"
 
+    [long]$receivedCount = 0
+    [long]$processedCount = 0
+    $collectionWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastProgressUpdate = [datetime]::MinValue
+
     try {
-        $events = Get-WinEvent -ComputerName $dcName -FilterHashtable @{
-            LogName='Security'; Id=4768,4769; StartTime=$since
-        } -ErrorAction Stop
-    } catch {
+        # OPTIMIZED WINRM STREAMING + NAMED-FIELD COLLECTION
+        # ------------------------------------
+        # Get-WinEvent runs locally on the DC, but only a flat DTO containing the
+        # exact fields used by the v1.7 analysis engine is serialized over WinRM.
+        # Events are processed locally as they arrive; no large local or remote
+        # event array is created and no preliminary count/second log scan occurs.
+        Invoke-Command -ComputerName $dcName -ArgumentList $since,$collectionEnd -ErrorAction Stop -ScriptBlock {
+            param(
+                [datetime]$StartTime,
+                [datetime]$EndTime
+            )
+
+            # ------------------------------------------------------------
+            # LEGACY COLLECTOR — Windows PowerShell 2.0 / Server 2008 R2
+            # ------------------------------------------------------------
+            # PowerShell 2.0 does not reliably support the modern
+            # EventLogPropertySelector path or FilterHashtable behavior used by
+            # newer systems. Use one XPath query and parse XML locally on the DC.
+            # Only the normalized compact DTO crosses WinRM.
+            if ($PSVersionTable.PSVersion.Major -lt 3) {
+                $utcStart = $StartTime.ToUniversalTime().ToString(
+                    'yyyy-MM-ddTHH:mm:ss.fffZ',
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                )
+                $utcEnd = $EndTime.ToUniversalTime().ToString(
+                    'yyyy-MM-ddTHH:mm:ss.fffZ',
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                )
+
+                $legacyXPath = "*[System[((EventID=4768) or (EventID=4769)) and TimeCreated[@SystemTime>='$utcStart' and @SystemTime<='$utcEnd']]]"
+
+                Get-WinEvent `
+                    -LogName Security `
+                    -FilterXPath $legacyXPath `
+                    -ErrorAction Stop |
+                    ForEach-Object {
+                        $id = [int]$_.Id
+                        $eventData = @{}
+
+                        try {
+                            [xml]$eventXml = $_.ToXml()
+
+                            foreach ($dataNode in $eventXml.Event.EventData.Data) {
+                                $fieldName = [string]$dataNode.Name
+
+                                if (-not [string]::IsNullOrEmpty($fieldName)) {
+                                    $eventData[$fieldName] = [string]$dataNode.'#text'
+                                }
+                            }
+
+                            $source = [string]$eventData['TargetUserName']
+                            $target = [string]$eventData['ServiceName']
+                            $ticket = $eventData['TicketEncryptionType']
+                            $ip = [string]$eventData['IpAddress']
+
+                            $isValid = (
+                                -not [string]::IsNullOrEmpty($source) -and
+                                -not [string]::IsNullOrEmpty($target) -and
+                                $null -ne $ticket
+                            )
+
+                            New-Object PSObject -Property @{
+                                Id               = $id
+                                TimeCreated      = [datetime]$_.TimeCreated
+                                RecordId         = [long]$_.RecordId
+                                IsModern         = $false
+                                IsValid          = [bool]$isValid
+                                Source           = $source
+                                Target           = $target
+                                Ticket           = $ticket
+                                Ip               = $ip
+                                Keys             = $null
+                                Session          = $null
+                                AdvertizedEtypes = $null
+                                CollectorMode    = 'LegacyXPathXml'
+                                RemotePSVersion  = [string]$PSVersionTable.PSVersion
+                            }
+                        }
+                        catch {
+                            New-Object PSObject -Property @{
+                                Id               = $id
+                                TimeCreated      = [datetime]$_.TimeCreated
+                                RecordId         = [long]$_.RecordId
+                                IsModern         = $false
+                                IsValid          = $false
+                                Source           = $null
+                                Target           = $null
+                                Ticket           = $null
+                                Ip               = $null
+                                Keys             = $null
+                                Session          = $null
+                                AdvertizedEtypes = $null
+                                CollectorMode    = 'LegacyXPathXml'
+                                RemotePSVersion  = [string]$PSVersionTable.PSVersion
+                            }
+                        }
+                    }
+
+                return
+            }
+
+            # ------------------------------------------------------------
+            # MODERN COLLECTOR — PowerShell 3.0+
+            # ------------------------------------------------------------
+
+            # Resolve the required EventData fields by NAME rather than by Properties[]
+            # position. This prevents schema/layout differences from shifting fields such
+            # as TicketEncryptionType, SessionKeyEncryptionType and Available Keys.
+            # The selector is created once per DC and GetPropertyValues() returns only
+            # these values; ToXml() is never called.
+            $fieldNames = [string[]]@(
+                'TargetUserName',
+                'ServiceName',
+                'TicketEncryptionType',
+                'IpAddress',
+                'AccountAvailableKeys',
+                'ServiceAvailableKeys',
+                'SessionKeyEncryptionType',
+                'ClientAdvertizedEncryptionTypes',
+                'ClientAdvertisedEncryptionTypes'
+            )
+
+            $fieldXpaths = [string[]]@(
+                $fieldNames | ForEach-Object { "Event/EventData/Data[@Name='$_']" }
+            )
+
+            # New-Object keeps this remote block compatible with Windows PowerShell 2.0
+            # on Windows Server 2008 R2. The modern ::new() syntax is not used here.
+            $fieldSelector = New-Object `
+                System.Diagnostics.Eventing.Reader.EventLogPropertySelector `
+                -ArgumentList (,$fieldXpaths)
+
+# Implements the Test-RemoteBlank helper.
+            function Test-RemoteBlank {
+                param([object]$Value)
+                if ($null -eq $Value) { return $true }
+                return (([string]$Value).Trim().Length -eq 0)
+            }
+
+# Implements the Get-SelectedFieldValue helper.
+            function Get-SelectedFieldValue {
+                param(
+                    [object[]]$Values,
+                    [int]$Index
+                )
+
+                if ($null -eq $Values -or $Index -lt 0 -or $Index -ge $Values.Count) {
+                    return $null
+                }
+
+                $value = $Values[$Index]
+                if ($null -eq $value) { return $null }
+
+                $text = [string]$value
+                if ((Test-RemoteBlank $text) -or $text -eq '-') { return $null }
+                return $value
+            }
+
+            Get-WinEvent -FilterHashtable @{
+                LogName='Security'
+                Id=4768,4769
+                StartTime=$StartTime
+                EndTime=$EndTime
+            } -ErrorAction Stop | ForEach-Object {
+                $id = [int]$_.Id
+                $values = @()
+
+                $selectorSucceeded = $false
+                try {
+                    $values = @($_.GetPropertyValues($fieldSelector))
+                    $selectorSucceeded = $true
+                }
+                catch {
+                    $selectorSucceeded = $false
+                }
+
+                if ($selectorSucceeded) {
+                    $source  = Get-SelectedFieldValue $values 0 # TargetUserName
+                    $target  = Get-SelectedFieldValue $values 1 # ServiceName
+                    $ticket  = Get-SelectedFieldValue $values 2 # TicketEncryptionType
+                    $ip      = Get-SelectedFieldValue $values 3 # IpAddress
+                    $acctKey = Get-SelectedFieldValue $values 4 # AccountAvailableKeys
+                    $svcKey  = Get-SelectedFieldValue $values 5 # ServiceAvailableKeys
+                    $session = Get-SelectedFieldValue $values 6 # SessionKeyEncryptionType
+                    $adv1    = Get-SelectedFieldValue $values 7 # Microsoft spelling: Advertized
+                    $adv2    = Get-SelectedFieldValue $values 8 # Alternate spelling: Advertised
+                }
+                else {
+                    # Compatibility fallback for older KDC/PowerShell combinations.
+                    # XML is parsed locally on the DC and only the compact DTO crosses WinRM.
+                    $eventData = @{}
+                    try {
+                        [xml]$eventXml = $_.ToXml()
+                        foreach ($dataNode in $eventXml.Event.EventData.Data) {
+                            $fieldName = [string]$dataNode.Name
+                            if (-not (Test-RemoteBlank $fieldName)) {
+                                $eventData[$fieldName] = [string]$dataNode.'#text'
+                            }
+                        }
+                    }
+                    catch {
+                        New-Object PSObject -Property @{
+                            Id=$id; TimeCreated=[datetime]$_.TimeCreated; RecordId=[long]$_.RecordId
+                            IsModern=$false; IsValid=$false; Source=$null; Target=$null
+                            Ticket=$null; Ip=$null; Keys=$null; Session=$null
+                            AdvertizedEtypes=$null
+                            CollectorMode='ModernXmlFallback'
+                            RemotePSVersion=[string]$PSVersionTable.PSVersion
+                        }
+                        return
+                    }
+
+                    $source  = $eventData['TargetUserName']
+                    $target  = $eventData['ServiceName']
+                    $ticket  = $eventData['TicketEncryptionType']
+                    $ip      = $eventData['IpAddress']
+                    $acctKey = $eventData['AccountAvailableKeys']
+                    $svcKey  = $eventData['ServiceAvailableKeys']
+                    $session = $eventData['SessionKeyEncryptionType']
+                    $adv1    = $eventData['ClientAdvertizedEncryptionTypes']
+                    $adv2    = $eventData['ClientAdvertisedEncryptionTypes']
+                }
+
+                $advertizedEtypes = if ($null -ne $adv1 -and -not (Test-RemoteBlank $adv1)) { $adv1 } else { $adv2 }
+
+                # Microsoft attribution is preserved:
+                # 4769 -> ServiceAvailableKeys belongs to the TARGET service account.
+                # 4768 -> AccountAvailableKeys belongs to the SOURCE account.
+                $keys = if ($id -eq 4769) { $svcKey } else { $acctKey }
+
+                # Validate the minimum named fields required for attribution. Missing
+                # optional modern fields do not invalidate the event.
+                $isValid = -not (Test-RemoteBlank $source) -and
+                           -not (Test-RemoteBlank $target) -and
+                           $null -ne $ticket
+
+                $isModern = ($null -ne $acctKey -or $null -ne $svcKey -or
+                             $null -ne $session -or $null -ne $advertizedEtypes)
+
+                New-Object PSObject -Property @{
+                    Id               = $id
+                    TimeCreated      = [datetime]$_.TimeCreated
+                    RecordId         = [long]$_.RecordId
+                    IsModern         = [bool]$isModern
+                    IsValid          = [bool]$isValid
+                    Source           = if ($null -ne $source) { [string]$source } else { $null }
+                    Target           = if ($null -ne $target) { [string]$target } else { $null }
+                    Ticket           = $ticket
+                    Ip               = if ($null -ne $ip) { [string]$ip } else { $null }
+                    Keys             = $keys
+                    Session          = $session
+                    AdvertizedEtypes = $advertizedEtypes
+                    CollectorMode = if($selectorSucceeded){'ModernNamedField'}else{'ModernXmlFallback'}
+                    RemotePSVersion = [string]$PSVersionTable.PSVersion
+                }
+            }
+        } | ForEach-Object {
+            $dto = $_
+            $receivedCount++
+            $totalEvents++
+
+            if ([bool]$dto.IsModern) { $modernEvents++ } else { $legacyEvents++ }
+
+            if ([bool]$dto.IsValid) {
+                if ([int]$dto.Id -eq 4769) {
+                    # Target/service account: TGS encryption and Available Keys are
+                    # attributed exactly as in Microsoft's reference scripts.
+                    $targetState = Get-OrCreateState $states ([string]$dto.Target)
+                    if ($null -ne $targetState) {
+                        Touch-State $targetState ([datetime]$dto.TimeCreated) $dcName ([long]$dto.RecordId)
+                        Add-SchemaEvidence $targetState ([bool]$dto.IsModern)
+                        Add-CollectorEvidence $targetState ([string]$dto.CollectorMode) ([string]$dto.RemotePSVersion)
+                        Add-KeyEvidence $targetState $dto.Keys $dcName ([long]$dto.RecordId)
+                        Add-TargetUsage $targetState $dto.Ticket $dto.Session 'TGS' $dcName
+                        Add-AdvertizedEtypesEvidence $targetState $dto.AdvertizedEtypes
+                        Add-RequesterAdvertizedEvidence $targetState ([string]$dto.Source) $dto.AdvertizedEtypes
+
+                        $normalizedSource = Normalize-PrincipalName ([string]$dto.Source)
+                        if ($normalizedSource) {
+                            [void]$targetState.RequestingPrincipals.Add($normalizedSource)
+                        }
+                        if (-not [string]::IsNullOrWhiteSpace([string]$dto.Ip)) {
+                            [void]$targetState.RequesterAddresses.Add([string]$dto.Ip)
+                        }
+                    }
+
+                    # Requestor context only; this does not attribute the target's
+                    # TGS encryption to the requesting account.
+                    $sourceState = Get-OrCreateState $states ([string]$dto.Source)
+                    if ($null -ne $sourceState) {
+                        Touch-State $sourceState ([datetime]$dto.TimeCreated) $dcName ([long]$dto.RecordId)
+                        Add-SchemaEvidence $sourceState ([bool]$dto.IsModern)
+                        Add-CollectorEvidence $sourceState ([string]$dto.CollectorMode) ([string]$dto.RemotePSVersion)
+                        Add-RequesterContext $sourceState $dto.Ticket $dto.Session ([string]$dto.Target) ([string]$dto.Ip)
+                    }
+                }
+                elseif ([int]$dto.Id -eq 4768) {
+                    # For 4768, Microsoft attributes Properties[16] Available Keys
+                    # to the source account.
+                    $sourceState = Get-OrCreateState $states ([string]$dto.Source)
+                    if ($null -ne $sourceState) {
+                        Touch-State $sourceState ([datetime]$dto.TimeCreated) $dcName ([long]$dto.RecordId)
+                        Add-SchemaEvidence $sourceState ([bool]$dto.IsModern)
+                        Add-CollectorEvidence $sourceState ([string]$dto.CollectorMode) ([string]$dto.RemotePSVersion)
+                        Add-KeyEvidence $sourceState $dto.Keys $dcName ([long]$dto.RecordId)
+                        Add-TargetUsage $sourceState $dto.Ticket $dto.Session 'AS' $dcName
+                        Add-AdvertizedEtypesEvidence $sourceState $dto.AdvertizedEtypes
+                        Add-RequesterContext $sourceState $dto.Ticket $dto.Session ([string]$dto.Target) ([string]$dto.Ip)
+                    }
+                }
+            }
+
+            $processedCount++
+            $now = Get-Date
+            if (($processedCount % 500 -eq 0) -or (($now - $lastProgressUpdate).TotalSeconds -ge 1)) {
+                $elapsedSeconds = [math]::Max($collectionWatch.Elapsed.TotalSeconds, 0.001)
+                $rate = [math]::Round($processedCount / $elapsedSeconds, 1)
+                $status = ('Received and processed {0:N0} events | Elapsed {1:hh\:mm\:ss} | {2:N1} events/sec' -f `
+                    $processedCount, $collectionWatch.Elapsed, $rate)
+
+                Write-Progress -Id 10 `
+                    -Activity "Collecting and processing Kerberos events from $dcName" `
+                    -Status $status `
+                    -PercentComplete -1 `
+                    -SecondsRemaining -1
+
+                $lastProgressUpdate = $now
+            }
+        }
+
+        $collectionWatch.Stop()
+        Write-Progress -Id 10 -Activity "Collecting and processing Kerberos events from $dcName" -Completed
+        Write-Host ('    Complete: {0:N0} events received and processed in {1:hh\:mm\:ss}' -f `
+            $processedCount, $collectionWatch.Elapsed) -ForegroundColor DarkGray
+    }
+    catch {
+        $collectionWatch.Stop()
+        Write-Progress -Id 10 -Activity "Collecting and processing Kerberos events from $dcName" -Completed
         $errors.Add([pscustomobject]@{DomainController=$dcName;Error=$_.Exception.Message})
         Write-Warning "Could not read $dcName : $($_.Exception.Message)"
         continue
-    }
-
-    foreach ($e in $events) {
-        $totalEvents++
-        $p = @($e.Properties)
-        $eventData = Get-EventDataMap $e
-        $advertizedEtypes = Get-EventDataValue $eventData @(
-            'ClientAdvertizedEncryptionTypes',
-            'ClientAdvertisedEncryptionTypes'
-        )
-
-        # Microsoft's scripts require the modern event metadata. We still process
-        # usage from older events when enough fields exist, but account-key evidence
-        # is only accepted when Properties[16] is present.
-        if ($p.Count -ge 21) { $modernEvents++ } else { $legacyEvents++ }
-
-        if ($e.Id -eq 4769) {
-            if ($p.Count -lt 7) { continue }
-
-            # EXACT official Get-KerbEncryptionUsage.ps1 positions.
-            $source = [string]$p[0].Value
-            $target = [string]$p[2].Value
-            $ticket = $p[5].Value
-            $ip = [string]$p[6].Value
-            $session = if ($p.Count -gt 20) { $p[20].Value } else { $null }
-
-            # EXACT official List-AccountKeys.ps1 key position.
-            $keys = if ($p.Count -gt 16) { $p[16].Value } else { $null }
-
-            # Target/service account: this is where TGS encryption and account keys belong.
-            $targetState = Get-OrCreateState $states $target
-            Touch-State $targetState $e.TimeCreated $dcName $e.RecordId
-            Add-KeyEvidence $targetState $keys
-            Add-TargetUsage $targetState $ticket $session 'TGS'
-            Add-AdvertizedEtypesEvidence $targetState $advertizedEtypes
-            Add-RequesterAdvertizedEvidence $targetState $source $advertizedEtypes
-            if ($source) { [void]$targetState.RequestingPrincipals.Add((Normalize-PrincipalName $source)) }
-            if ($ip) { [void]$targetState.RequesterAddresses.Add($ip) }
-
-            # Source/requestor: context only for 4769. Do NOT attribute the TGS encryption
-            # to the requestor as an account remediation finding.
-            $sourceState = Get-OrCreateState $states $source
-            Touch-State $sourceState $e.TimeCreated $dcName $e.RecordId
-            Add-RequesterContext $sourceState $ticket $session $target $ip
-        }
-        elseif ($e.Id -eq 4768) {
-            if ($p.Count -lt 10) { continue }
-
-            # EXACT official Get-KerbEncryptionUsage.ps1 positions.
-            $source = [string]$p[0].Value
-            $target = [string]$p[3].Value
-            $ticket = $p[7].Value
-            $ip = [string]$p[9].Value
-            $session = if ($p.Count -gt 22) { $p[22].Value } else { $null }
-
-            # EXACT official List-AccountKeys.ps1 key position.
-            # For 4768 Microsoft attributes Properties[16] to Properties[0] (source account).
-            $keys = if ($p.Count -gt 16) { $p[16].Value } else { $null }
-
-            $sourceState = Get-OrCreateState $states $source
-            Touch-State $sourceState $e.TimeCreated $dcName $e.RecordId
-            Add-KeyEvidence $sourceState $keys
-            Add-TargetUsage $sourceState $ticket $session 'AS'
-            Add-AdvertizedEtypesEvidence $sourceState $advertizedEtypes
-            Add-RequesterContext $sourceState $ticket $session $target $ip
-        }
     }
 }
 
@@ -665,9 +1130,31 @@ foreach ($dc in $dcs) {
     $dcName = [string]$dc.HostName
     Write-Step "Reading KDCSVC 201-209 from $dcName"
     try {
-        $systemEvents = @(Get-WinEvent -ComputerName $dcName -FilterHashtable @{
-            LogName='System'; Id=201,202,203,204,205,206,207,208,209; StartTime=$since
-        } -ErrorAction Stop)
+        $systemEvents = @(Invoke-Command -ComputerName $dcName -ArgumentList $since,$collectionEnd -ErrorAction Stop -ScriptBlock {
+            param(
+                [datetime]$StartTime,
+                [datetime]$EndTime
+            )
+
+            Get-WinEvent -FilterHashtable @{
+                LogName='System'
+                Id=201,202,203,204,205,206,207,208,209
+                StartTime=$StartTime
+                EndTime=$EndTime
+            } -ErrorAction Stop | ForEach-Object {
+                $message = ''
+                try { $message = [string]$_.Message } catch {}
+
+                New-Object PSObject -Property @{
+                    Id               = [int]$_.Id
+                    TimeCreated      = [datetime]$_.TimeCreated
+                    RecordId         = [long]$_.RecordId
+                    ProviderName     = [string]$_.ProviderName
+                    LevelDisplayName = [string]$_.LevelDisplayName
+                    Message          = $message
+                }
+            }
+        })
 
         foreach ($ke in $systemEvents) {
             $provider = [string]$ke.ProviderName
@@ -699,7 +1186,7 @@ foreach ($dc in $dcs) {
 Write-Step "Collected $totalEvents Security events ($modernEvents modern-schema, $legacyEvents legacy-schema)"
 Write-Step "Collected $($kdcEvents.Count) KDCSVC 201-209 events"
 Write-Step "Observed $($states.Count) unique principals"
-Write-Step "v1.7 enrichment: Advertized Etypes / Client AES Support collected from modern event XML when available"
+Write-Step "Automatic compatibility: Legacy, Modern, and Hybrid evidence detected from event fields"
 
 $results = [System.Collections.Generic.List[object]]::new()
 
@@ -712,10 +1199,40 @@ foreach ($entry in $states.GetEnumerator()) {
     if (-not $ad) { continue }
 
     $enc = Convert-SupportedEncryptionTypes $ad.'msDS-SupportedEncryptionTypes'
+    $isKrbtgt = (
+        [string]::Equals([string]$s.Name,'krbtgt',[System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals([string]$ad.sAMAccountName,'krbtgt',[System.StringComparison]::OrdinalIgnoreCase)
+    )
+
+    # Exclude the built-in krbtgt account from every report output.
+    if ($isKrbtgt) { continue }
+
+    $status = if (([int64]$ad.userAccountControl -band 0x2) -ne 0) {
+        'Disabled'
+    }
+    else {
+        'Enabled'
+    }
+
+    $assessmentMode = Get-AssessmentMode $s
     $keys = @($s.AvailableKeys | Sort-Object)
     $hasAESKey = @($keys | Where-Object { Test-IsAES $_ }).Count -gt 0
     $hasRC4Key = @($keys | Where-Object { Test-IsRC4 $_ }).Count -gt 0
     $explicitAES = $enc.AES128 -or $enc.AES256
+
+    $keyEvidenceConflict = (
+        $s.AESKeyEvidenceEvents -gt 0 -and
+        $s.RC4OnlyKeyEvidenceEvents -gt 0
+    )
+
+    $conclusiveRC4OnlyKeyEvidence = (
+        $s.KeyEvidenceEvents -gt 0 -and
+        $s.RC4OnlyKeyEvidenceEvents -gt 0 -and
+        $s.AESKeyEvidenceEvents -eq 0 -and
+        $s.OtherKeyEvidenceEvents -eq 0 -and
+        $hasRC4Key -and
+        -not $hasAESKey
+    )
 
     $spns = @($ad.servicePrincipalName)
     $hasSPN = $spns.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace(($spns -join ''))
@@ -723,13 +1240,11 @@ foreach ($entry in $states.GetEnumerator()) {
     $class = Get-Classification `
         -RC4TgsObserved ($s.RC4TgsTargetCount -gt 0) `
         -RC4AsObserved ($s.RC4AsCount -gt 0) `
+        -AESTicketObserved ($s.AESTicketCount -gt 0) `
+        -AESSessionObserved ($s.AESSessionCount -gt 0) `
         -HasAESKeyEvidence $hasAESKey `
-        -HasRC4KeyEvidence $hasRC4Key `
         -ExplicitRC4 $enc.RC4 `
-        -ExplicitAES $explicitAES `
-        -HasSPN $hasSPN `
-        -ObjectClass ([string]$ad.objectClass) `
-        -HasKeyTelemetry ($s.KeyEvidenceEvents -gt 0)
+        -ExplicitAES $explicitAES
 
     $pwdLastSet = $null
     if ($ad.pwdLastSet -and [int64]$ad.pwdLastSet -gt 0) {
@@ -739,14 +1254,21 @@ foreach ($entry in $states.GetEnumerator()) {
     $results.Add([pscustomobject]@{
         Severity=$class.Severity
         NeedsAction=$class.NeedsAction
+        Status=$status
         Account=$s.Name
+        AccountType=if([string]$ad.objectClass -eq 'computer'){'Computer'}elseif($hasSPN){'Service'}else{'User'}
+        RC4Seen=if(($s.RC4TgsTargetCount -gt 0) -or ($s.RC4AsCount -gt 0)){'Yes'}else{'No'}
+        SamAccountName=[string]$ad.sAMAccountName
+        UserPrincipalName=[string]$ad.userPrincipalName
         ObjectClass=[string]$ad.objectClass
         UPN=[string]$ad.userPrincipalName
         HasSPN=$hasSPN
         SPNs=$spns -join '; '
+        ServicePrincipalNames=$spns -join '; '
         PasswordLastSet=$pwdLastSet
         msDSSupportedEncryptionTypesHex=$enc.Hex
         msDSSupportedEncryptionTypes=$enc.Summary
+        EncryptionFlags=$enc.Summary
         ExplicitRC4=$enc.RC4
         ExplicitAES=$explicitAES
 
@@ -755,6 +1277,11 @@ foreach ($entry in $states.GetEnumerator()) {
         HasAESKey=$hasAESKey
         HasRC4Key=$hasRC4Key
         KeyEvidenceEvents=$s.KeyEvidenceEvents
+        RC4OnlyKeyEvidenceEvents=$s.RC4OnlyKeyEvidenceEvents
+        AESKeyEvidenceEvents=$s.AESKeyEvidenceEvents
+        OtherKeyEvidenceEvents=$s.OtherKeyEvidenceEvents
+        ConclusiveRC4OnlyKeyEvidence=$conclusiveRC4OnlyKeyEvidence
+        ConflictingKeyEvidence=$keyEvidenceConflict
 
         # Client/requester capability from modern event XML.
         # For a 4769 target row, these are the etypes advertised by clients that
@@ -768,9 +1295,13 @@ foreach ($entry in $states.GetEnumerator()) {
 
         # Official Get-KerbEncryptionUsage perspective attributed to THIS account
         TicketEncryptionObserved=@($s.TicketTypes | Sort-Object) -join '; '
+        ObservedTicketEncryption=@($s.TicketTypes | Sort-Object) -join '; '
         SessionKeyEncryptionObserved=@($s.SessionKeyTypes | Sort-Object) -join '; '
+        ObservedSessionEncryption=@($s.SessionKeyTypes | Sort-Object) -join '; '
         RC4TgsTargetCount=$s.RC4TgsTargetCount
         RC4AsCount=$s.RC4AsCount
+        AESTicketCount=$s.AESTicketCount
+        AESSessionCount=$s.AESSessionCount
 
         # Context: what this account requested from other targets; not classification input for TGS dependency
         RequestedTicketEncryption=@($s.RequestedTicketTypes | Sort-Object) -join '; '
@@ -780,21 +1311,46 @@ foreach ($entry in $states.GetEnumerator()) {
 
         RequestingPrincipals=@($s.RequestingPrincipals | Sort-Object) -join '; '
         RequesterAddresses=@($s.RequesterAddresses | Sort-Object) -join '; '
-        DomainControllers=@($s.DomainControllers | Sort-Object) -join '; '
-        EvidenceRecordIds=@($s.EvidenceRecordIds | Sort-Object) -join '; '
-        FirstSeen=$s.FirstSeen
         LastSeen=$s.LastSeen
-        Finding=$class.Finding
+        EvidenceFinding=$class.Finding
         Recommendation=$class.Recommendation
         DistinguishedName=[string]$ad.distinguishedName
     })
 }
 
-$rank=@{Critical=1;High=2;Medium=3;Review=4;Informational=5;Healthy=6}
-$results=@($results | Sort-Object @{Expression={$rank[$_.Severity]}},Account)
-$action=@($results | Where-Object NeedsAction)
+$rank=@{High=1;Medium=2;Healthy=3;Informational=4}
+$results=@($results | Sort-Object @{Expression={$rank[$_.Severity]}},Status,Account)
 
-$results | Export-Csv $csvPath -NoTypeInformation -Encoding UTF8
+# Dashboard remediation metrics represent currently enabled objects only.
+$activeResults=@($results | Where-Object Status -eq 'Enabled')
+$action=@($activeResults | Where-Object NeedsAction)
+$disabledResults=@($results | Where-Object Status -eq 'Disabled')
+$disabledRecentRC4=@($disabledResults | Where-Object {
+    $_.RC4TgsTargetCount -gt 0 -or $_.RC4AsCount -gt 0
+})
+
+$results |
+    Select-Object `
+        Severity,
+        Status,
+        Account,
+        AccountType,
+        RC4Seen,
+        ServicePrincipalNames,
+        AvailableKeys,
+        msDSSupportedEncryptionTypes,
+        AdvertizedEtypes,
+        RequesterAdvertizedEtypes,
+        ObservedTicketEncryption,
+        ObservedSessionEncryption,
+        RC4TgsTargetCount,
+        RC4AsCount,
+        RequestingPrincipals,
+        LastSeen,
+        EvidenceFinding,
+        Recommendation |
+    Export-Csv $csvPath -NoTypeInformation -Encoding UTF8
+
 if ($kdcEvents.Count -gt 0) {
     $kdcEvents | Export-Csv $kdcCsvPath -NoTypeInformation -Encoding UTF8
 } else {
@@ -802,37 +1358,42 @@ if ($kdcEvents.Count -gt 0) {
         Set-Content -Path $kdcCsvPath -Encoding UTF8
 }
 
-$critical=@($results|Where-Object Severity -eq Critical).Count
-$high=@($results|Where-Object Severity -eq High).Count
-$medium=@($results|Where-Object Severity -eq Medium).Count
-$review=@($results|Where-Object Severity -eq Review).Count
-$healthy=@($results|Where-Object Severity -eq Healthy).Count
-$info=@($results|Where-Object Severity -eq Informational).Count
-$actualRC4=@($results|Where-Object {$_.RC4TgsTargetCount -gt 0 -or $_.RC4AsCount -gt 0}).Count
+$high=@($activeResults|Where-Object Severity -eq High).Count
+$medium=@($activeResults|Where-Object Severity -eq Medium).Count
+$healthy=@($activeResults|Where-Object Severity -eq Healthy).Count
+$info=@($activeResults|Where-Object Severity -eq Informational).Count
+$actualRC4=@($activeResults|Where-Object {$_.RC4TgsTargetCount -gt 0 -or $_.RC4AsCount -gt 0}).Count
 
 $rows = foreach($r in $results) {
     $sev="sev-"+$r.Severity.ToLowerInvariant()
     $rc4=[bool]($r.RC4TgsTargetCount -gt 0 -or $r.RC4AsCount -gt 0)
-    $spnDisplay = if($r.HasSPN){ Convert-HtmlSafe $r.SPNs }else{'—'}
-    $requesterEtypes = if($r.RequesterAdvertizedEtypes){ Convert-HtmlSafe $r.RequesterAdvertizedEtypes }else{'—'}
+    $spnDisplay = Convert-ToHtmlRecordLines -Value $r.SPNs -Separator ';'
+    $availableKeysDisplay = Convert-ToHtmlEncryptionTags -Value $r.AvailableKeys
+    $supportedEncryptionDisplay = Convert-ToHtmlEncryptionTags -Value $r.msDSSupportedEncryptionTypes
+    $advertizedEtypesDisplay = Convert-ToHtmlEncryptionTags -Value $r.AdvertizedEtypes
+    $requesterEtypes = Convert-ToHtmlRequesterEtypeMap -Value $r.RequesterAdvertizedEtypes
+    $ticketEncryptionDisplay = Convert-ToHtmlEncryptionTags -Value $r.TicketEncryptionObserved
+    $sessionEncryptionDisplay = Convert-ToHtmlEncryptionTags -Value $r.SessionKeyEncryptionObserved
+    $requestingPrincipalsDisplay = Convert-ToHtmlRecordLines -Value $r.RequestingPrincipals -Separator ';'
 
-    "<tr data-severity='$($r.Severity)' data-action='$($r.NeedsAction)' data-rc4='$rc4'>"+
+    "<tr data-severity='$($r.Severity)' data-status='$($r.Status)' data-rc4='$rc4'>"+
     "<td><span class='badge $sev'>$(Convert-HtmlSafe $r.Severity)</span></td>"+
-    "<td>$(if($r.NeedsAction){'<span class=''action yes''>YES</span>'}else{'<span class=''action no''>NO</span>'})</td>"+
-    "<td><b>$(Convert-HtmlSafe $r.Account)</b><div class='sub'>$(Convert-HtmlSafe $r.UPN)</div></td>"+
-    "<td>$(Convert-HtmlSafe $r.ObjectClass)</td>"+
+    "<td><span class='status-badge status-$($r.Status.ToLowerInvariant())'>$(Convert-HtmlSafe $r.Status)</span></td>"+
+    "<td class='account-cell'><b>$(Convert-HtmlSafe $r.Account)</b><div class='sub'>$(Convert-HtmlSafe $r.UPN)</div></td>"+
+    "<td>$(Convert-HtmlSafe $r.AccountType)</td>"+
+    "<td class='num'>$(Convert-HtmlSafe $r.RC4Seen)</td>"+
     "<td class='spn'>$spnDisplay</td>"+
-    "<td>$(Convert-HtmlSafe $r.msDSSupportedEncryptionTypesHex)<div class='sub'>$(Convert-HtmlSafe $r.msDSSupportedEncryptionTypes)</div></td>"+
-    "<td>$(Convert-HtmlSafe $r.AvailableKeys)</td>"+
-    "<td>$(Convert-HtmlSafe $r.AdvertizedEtypes)</td>"+
-    "<td>$(Convert-HtmlSafe $r.ClientAESSupport)</td>"+
+    "<td>$availableKeysDisplay</td>"+
+    "<td><b class='nowrap-value'>$(Convert-HtmlSafe $r.msDSSupportedEncryptionTypesHex)</b><div class='sub'>$supportedEncryptionDisplay</div></td>"+
+    "<td>$advertizedEtypesDisplay</td>"+
     "<td class='requester-map'>$requesterEtypes</td>"+
-    "<td>$(Convert-HtmlSafe $r.TicketEncryptionObserved)</td>"+
-    "<td>$(Convert-HtmlSafe $r.SessionKeyEncryptionObserved)</td>"+
+    "<td>$ticketEncryptionDisplay</td>"+
+    "<td>$sessionEncryptionDisplay</td>"+
     "<td class='num'>$($r.RC4TgsTargetCount)</td>"+
-    "<td>$(Convert-HtmlSafe $r.RequestingPrincipals)</td>"+
-    "<td>$(Convert-HtmlSafe $r.LastSeen)</td>"+
-    "<td class='finding'>$(Convert-HtmlSafe $r.Finding)</td>"+
+    "<td class='num'>$($r.RC4AsCount)</td>"+
+    "<td>$requestingPrincipalsDisplay</td>"+
+    "<td class='nowrap-value'>$(Convert-HtmlSafe $r.LastSeen)</td>"+
+    "<td class='finding'>$(Convert-HtmlSafe $r.EvidenceFinding)</td>"+
     "<td class='recommendation'>$(Convert-HtmlSafe $r.Recommendation)</td>"+
     "</tr>"
 }
@@ -862,7 +1423,7 @@ $html=@"
 :root{
  --bg:#f3f6fa;--panel:#fff;--border:#d9e1ea;--text:#172033;--muted:#68758a;
  --blue:#0f4c78;--blue2:#1e73b7;--critical:#d92d20;--high:#e55b13;--medium:#e7a008;
- --info:#2878c8;--healthy:#169b62;--review:#6554c0
+ --info:#2878c8;--healthy:#169b62;--disabled:#667085
 }
 *{box-sizing:border-box}
 body{margin:0;font-family:"Segoe UI",Arial,sans-serif;background:var(--bg);color:var(--text);font-size:13px}
@@ -870,72 +1431,59 @@ body{margin:0;font-family:"Segoe UI",Arial,sans-serif;background:var(--bg);color
 .hero{background:linear-gradient(110deg,#103b60,#2378b8);color:#fff;border-radius:18px;padding:26px 30px;display:flex;justify-content:space-between;gap:30px;box-shadow:0 1px 2px rgba(16,24,40,.08)}
 .hero h1{margin:0 0 8px;font-size:28px;font-weight:700}.hero p{margin:3px 0;color:#e7f1fa;max-width:980px;line-height:1.45}
 .meta{text-align:right;min-width:250px;font-size:12px;line-height:1.5;color:#e7f1fa}.meta b{color:#fff}
-.cards{display:grid;grid-template-columns:repeat(7,minmax(145px,1fr));gap:14px;margin:18px 0}
+.cards{display:grid;grid-template-columns:repeat(8,minmax(135px,1fr));gap:14px;margin:18px 0}
 .card{background:#fff;border:1px solid var(--border);border-radius:14px;padding:16px 18px;border-left:5px solid #3b82f6;box-shadow:0 1px 2px rgba(16,24,40,.04)}
-.card .l{color:var(--muted);font-size:12px}.card .n{font-size:28px;font-weight:700;margin-top:6px}.c-action{border-left-color:#f59e0b}.c-rc4{border-left-color:#ef4444}.c-critical{border-left-color:var(--critical)}.c-high{border-left-color:var(--high)}.c-medium{border-left-color:var(--medium)}.c-good{border-left-color:var(--healthy)}
+.card .l{color:var(--muted);font-size:12px}.card .n{font-size:28px;font-weight:700;margin-top:6px}.c-action{border-left-color:#f59e0b}.c-rc4{border-left-color:#ef4444}.c-critical{border-left-color:var(--critical)}.c-high{border-left-color:var(--high)}.c-medium{border-left-color:var(--medium)}.c-disabled{border-left-color:var(--disabled)}.c-good{border-left-color:var(--healthy)}
 .note{background:#fff;border:1px solid var(--border);border-left:5px solid var(--blue2);padding:14px 16px;margin:0 0 16px;border-radius:10px;line-height:1.45}
 .controls{background:#fff;border:1px solid var(--border);border-radius:14px;padding:13px 16px;display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
 input{min-width:360px;flex:1;border:1px solid #c9d3df;border-radius:8px;padding:9px 11px;background:#fff}
 button{border:1px solid #c9d3df;background:#fff;border-radius:8px;padding:8px 12px;cursor:pointer;color:#344054}button:hover{background:#f4f7fa}
+.table-scroll-shell{width:100%}
+.table-scroll-top{width:100%;overflow-x:auto;overflow-y:hidden;height:18px;margin-bottom:6px}
+.table-scroll-top-inner{height:1px}
 .tablewrap{width:100%;overflow-x:auto;overflow-y:visible;background:#fff;border:1px solid var(--border);border-radius:14px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
 table{border-collapse:collapse;width:100%;table-layout:auto;font-size:12px}th{position:sticky;top:0;z-index:2;background:#f7f9fc;text-align:left;padding:11px;border-bottom:1px solid var(--border);white-space:nowrap;color:#344054}
 td{vertical-align:top;padding:10px 11px;border-bottom:1px solid #edf0f4;line-height:1.4}.sub{color:var(--muted);font-size:10.5px;margin-top:3px}.num{text-align:center;font-weight:700}
-.spn{white-space:normal;overflow-wrap:anywhere;line-height:1.35;min-width:150px;max-width:280px}
-.requester-map{white-space:normal;overflow-wrap:anywhere;line-height:1.35;min-width:170px;max-width:320px}
+.account-cell,.account-cell b,.account-cell .sub{white-space:nowrap!important;word-break:normal!important;overflow-wrap:normal!important}
+.record-line{white-space:nowrap!important;word-break:normal!important;overflow-wrap:normal!important;display:block;margin:0 0 3px 0}
+.record-line:last-child{margin-bottom:0}
+.crypto-line{display:block;margin:0 0 4px 0;white-space:nowrap}
+.crypto-line:last-child{margin-bottom:0}
+.crypto-tag{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid #c9d3df;background:#f8fafc;color:#344054;font-weight:600;white-space:nowrap}
+.crypto-aes{background:#e7f8ef;border-color:#6fd3a4;color:#067647}
+.crypto-rc4{background:#fff0e6;border-color:#fb923c;color:#b54708}
+.crypto-des{background:#fee4e2;border-color:#f97066;color:#b42318}
+.requester-block{margin:0 0 8px 0}
+.requester-block:last-child{margin-bottom:0}
+.requester-name{font-weight:700;white-space:nowrap;margin-bottom:4px}
+.nowrap-value{white-space:nowrap!important;word-break:normal!important;overflow-wrap:normal!important}
+.spn{white-space:normal;overflow-wrap:normal;word-break:normal;line-height:1.35;min-width:220px;max-width:none}
+.requester-map{white-space:normal;overflow-wrap:normal;word-break:normal;line-height:1.35;min-width:220px;max-width:none}
 .finding{white-space:normal;overflow-wrap:anywhere;min-width:190px}
 .recommendation{white-space:normal;overflow-wrap:anywhere;min-width:240px}
-.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-weight:700;font-size:11px;border:1px solid}
-.sev-critical{background:#fee4e2;border-color:#f97066;color:#b42318}.sev-high{background:#fff0e6;border-color:#fb923c;color:#b54708}.sev-medium{background:#fff7d6;border-color:#f5c242;color:#7a4d00}.sev-review{background:#eeeafd;border-color:#a99cf5;color:#42307d}.sev-informational{background:#eaf3ff;border-color:#84b9f4;color:#175cd3}.sev-healthy{background:#e7f8ef;border-color:#6fd3a4;color:#067647}
-.action{font-weight:700}.action.yes{color:#b54708}.action.no{color:#667085}
+.badge,.status-badge{display:inline-block;padding:4px 10px;border-radius:999px;font-weight:700;font-size:11px;border:1px solid}
+.status-badge{white-space:nowrap!important;word-break:normal!important;overflow-wrap:normal!important;min-width:90px;text-align:center}
+.sev-high{background:#fff0e6;border-color:#fb923c;color:#b54708}.sev-medium{background:#fff7d6;border-color:#f5c242;color:#7a4d00}.sev-informational{background:#eaf3ff;border-color:#84b9f4;color:#175cd3}.sev-healthy{background:#e7f8ef;border-color:#6fd3a4;color:#067647}
+.status-enabled{background:#e7f8ef;border-color:#6fd3a4;color:#067647}.status-disabled{background:#f2f4f7;border-color:#98a2b3;color:#475467}
 .section{margin-top:24px}.section h2{font-size:18px;margin:0 0 10px}.smalltable{min-width:0}.kdc-table{min-width:0}
 footer{color:var(--muted);font-size:11px;margin-top:18px;line-height:1.5}
 #main th{white-space:normal;overflow-wrap:normal;word-break:normal;hyphens:none}
 #main td{white-space:normal;overflow-wrap:anywhere;word-break:normal}
 
-/* Never split compact labels or single-word headers */
-#main th:nth-child(1),
-#main th:nth-child(2),
-#main th:nth-child(4),
-#main th:nth-child(9),
-#main th:nth-child(13),
-#main td:nth-child(1),
-#main td:nth-child(2),
-#main td:nth-child(4),
-#main td:nth-child(9),
-#main td:nth-child(13){
-  white-space:nowrap;
-  overflow-wrap:normal;
-  word-break:normal;
-}
-
-/* Keep status badges intact */
-.badge,
-.action{
-  white-space:nowrap !important;
-  word-break:normal !important;
-  overflow-wrap:normal !important;
-}
-#main th:nth-child(1),#main td:nth-child(1){width:78px;min-width:78px}
-#main th:nth-child(2),#main td:nth-child(2){width:68px;min-width:68px}
-#main th:nth-child(3),#main td:nth-child(3){min-width:125px}
-#main th:nth-child(4),#main td:nth-child(4){width:72px;min-width:72px}
-#main th:nth-child(5),#main td:nth-child(5){min-width:150px;max-width:280px}
-#main th:nth-child(6),#main td:nth-child(6){min-width:115px}
-#main th:nth-child(7),#main td:nth-child(7){min-width:110px}
-#main th:nth-child(8),#main td:nth-child(8){min-width:120px}
-#main th:nth-child(9),#main td:nth-child(9){width:96px;min-width:96px}
-#main th:nth-child(10),#main td:nth-child(10){min-width:170px;max-width:320px}
-#main th:nth-child(11),#main td:nth-child(11){min-width:110px}
-#main th:nth-child(12),#main td:nth-child(12){min-width:110px}
-#main th:nth-child(13),#main td:nth-child(13){width:64px;min-width:64px}
-#main th:nth-child(14),#main td:nth-child(14){min-width:125px}
-#main th:nth-child(15),#main td:nth-child(15){min-width:110px}
-#main th:nth-child(16),#main td:nth-child(16){min-width:190px}
-#main th:nth-child(17),#main td:nth-child(17){min-width:240px}
+/* Keep compact status labels intact */
+.badge,.action{white-space:nowrap !important;word-break:normal !important;overflow-wrap:normal !important}
+#main th,#main td{min-width:105px}
+#main th:nth-child(1),#main td:nth-child(1){min-width:82px}
+#main th:nth-child(2),#main td:nth-child(2){min-width:100px;text-align:center}
+#main th:nth-child(3),#main td:nth-child(3){min-width:190px;white-space:nowrap}
+#main th:nth-child(4),#main td:nth-child(4){min-width:135px}
+#main th:nth-child(6),#main td:nth-child(6){min-width:260px;max-width:none}
+#main th:nth-last-child(2),#main td:nth-last-child(2){min-width:260px}
+#main th:nth-last-child(1),#main td:nth-last-child(1){min-width:300px}
 @media (min-width:2200px){.wrap{padding:24px 32px}table{font-size:12.5px}th,td{padding:10px 12px}.spn{max-width:360px}.requester-map{max-width:420px}}
 @media (max-width:1920px){.wrap{padding:18px}table{font-size:11px}th,td{padding:7px 8px}.cards{gap:10px}.hero{padding:22px 24px}.hero h1{font-size:25px}.spn{min-width:135px;max-width:240px}.requester-map{min-width:150px;max-width:260px}.finding{min-width:170px}.recommendation{min-width:220px}}
 @media (max-width:1400px){table{font-size:10px}th,td{padding:6px}.cards{grid-template-columns:repeat(4,minmax(135px,1fr))}.requester-map{max-width:220px}.spn{max-width:210px}.recommendation{min-width:200px}.finding{min-width:155px}}
-@media (max-width:1100px){.cards{grid-template-columns:repeat(2,1fr)}.hero{flex-direction:column}.meta{text-align:left}.wrap{padding:14px}.tablewrap{overflow-x:auto}#main{min-width:1800px}}
+@media (max-width:1100px){.cards{grid-template-columns:repeat(2,1fr)}.hero{flex-direction:column}.meta{text-align:left}.wrap{padding:14px}.tablewrap{overflow-x:auto}#main{min-width:2050px}}
 </style>
 </head>
 <body>
@@ -943,7 +1491,7 @@ footer{color:var(--muted);font-size:11px;margin-top:18px;line-height:1.5}
 <div class="hero">
  <div>
   <h1>Kerberos RC4 Assessment</h1>
-  <p>Consolidated Active Directory assessment of Kerberos encryption usage, available account keys, client-advertised encryption types, SPN ownership, and service-account configuration.</p>
+  <p>Consolidated Kerberos encryption assessment based on Microsoft event telemetry collected across all selected Domain Controllers.</p>
   <p><b>Domain:</b> $(Convert-HtmlSafe $domain.DNSRoot) &nbsp; | &nbsp; <b>Forest:</b> $(Convert-HtmlSafe $forest.Name) &nbsp; | &nbsp; <b>Window:</b> $(Convert-HtmlSafe $since) to $(Convert-HtmlSafe $generatedAt)</p>
  </div>
  <div class="meta">
@@ -954,51 +1502,60 @@ footer{color:var(--muted);font-size:11px;margin-top:18px;line-height:1.5}
 </div>
 
 <div class="cards">
- <div class="card"><div class="l">Kerberos principals assessed</div><div class="n">$($results.Count)</div></div>
- <div class="card c-action"><div class="l">Needs action</div><div class="n">$($action.Count)</div></div>
- <div class="card c-rc4"><div class="l">Observed RC4 usage</div><div class="n">$actualRC4</div></div>
- <div class="card c-critical"><div class="l">Critical</div><div class="n">$critical</div></div>
+ <div class="card"><div class="l">Enabled accounts evaluated</div><div class="n">$($activeResults.Count)</div></div>
+ <div class="card c-action"><div class="l">Enabled accounts requiring action</div><div class="n">$($action.Count)</div></div>
+ <div class="card c-rc4"><div class="l">Enabled accounts with RC4 observed</div><div class="n">$actualRC4</div></div>
  <div class="card c-high"><div class="l">High</div><div class="n">$high</div></div>
  <div class="card c-medium"><div class="l">Medium</div><div class="n">$medium</div></div>
- <div class="card c-good"><div class="l">Healthy / Informational</div><div class="n">$($healthy+$info)</div></div>
+ <div class="card c-good"><div class="l">Healthy</div><div class="n">$healthy</div></div>
+ <div class="card"><div class="l">Informational</div><div class="n">$info</div></div>
+ <div class="card c-disabled"><div class="l">Disabled accounts collected</div><div class="n">$($disabledResults.Count)</div></div>
 </div>
 
 <div class="note">
-<b>Assessment model:</b> Security Events <b>4768/4769</b> provide observed Kerberos usage. <b>Available Keys</b> follows Microsoft List-AccountKeys account attribution. <b>Ticket/Session encryption</b> follows Get-KerbEncryptionUsage semantics. Active Directory adds <b>msDS-SupportedEncryptionTypes</b> and the actual <b>Service Principal Names</b>. Client-advertised encryption types are preserved per requester for investigation. <b>KDCSVC 201-209</b> are collected separately as CVE-2026-20833 enforcement-readiness evidence and do not independently change account severity.
+<b>Assessment model:</b> Collection and account attribution follow the same Kerberos event semantics used by Microsoft's <b>Get-KerbEncryptionUsage.ps1</b> and <b>List-AccountKeys.ps1</b>. Events <b>4768/4769</b> are collected from every selected Domain Controller and consolidated into one row per AD principal. Legacy DCs contribute the fields available in their event schema; enhanced DCs also contribute Available Keys, session encryption, and client-advertised encryption types. Active Directory adds <b>msDS-SupportedEncryptionTypes</b> and <b>Service Principal Names</b>. Disabled accounts are collected but hidden by default; use the status filters to display them. The built-in <b>krbtgt</b> account is excluded from all outputs. Severity is an operational prioritization model, not an official Microsoft severity rating.
 </div>
 
 <div class="controls">
- <input id="q" type="search" placeholder="Search account, SPN, requester, encryption, finding or recommendation...">
- <button onclick="setFilter('ALL')">All</button>
- <button onclick="setFilter('ACTION')">Needs action</button>
- <button onclick="setFilter('RC4')">Observed RC4</button>
- <button onclick="setFilter('Critical')">Critical</button>
- <button onclick="setFilter('High')">High</button>
- <button onclick="setFilter('Medium')">Medium</button>
- <button onclick="setFilter('INFO')">Healthy / Informational</button>
+ <input id="q" type="search" placeholder="Search account, SPN, requester, encryption, evidence or recommendation...">
+ <span class="sub"><b>Status:</b></span>
+ <button onclick="setStatusFilter('Enabled')">Enabled</button>
+ <button onclick="setStatusFilter('Disabled')">Disabled</button>
+ <button onclick="setStatusFilter('ALL')">All</button>
+ <span class="sub"><b>Severity:</b></span>
+ <button onclick="setSeverityFilter('ALL')">All severities</button>
+ <button onclick="setSeverityFilter('High')">High</button>
+ <button onclick="setSeverityFilter('Medium')">Medium</button>
+ <button onclick="setSeverityFilter('Healthy')">Healthy</button>
+ <button onclick="setSeverityFilter('Informational')">Informational</button>
+ <button onclick="setSeverityFilter('RC4')">RC4 observed</button>
 </div>
 
-<div class="tablewrap"><table id="main">
+<div class="table-scroll-shell">
+<div id="mainScrollTop" class="table-scroll-top"><div id="mainScrollTopInner" class="table-scroll-top-inner"></div></div>
+<div id="mainScrollBottom" class="tablewrap"><table id="main">
 <thead><tr>
-<th>Severity</th><th>Action</th><th>Account</th><th>Type</th><th>Service Principal Names</th>
-<th>msDS-SupportedEncryptionTypes</th><th>Available Keys</th><th>Advertised Etypes</th><th>Client AES Support</th>
-<th>Requester → Advertised Etypes</th><th>Observed Ticket Encryption</th><th>Observed Session Encryption</th>
-<th>RC4 TGS</th><th>Requesting Principals</th><th>Last Seen</th><th>Finding</th><th>Recommendation</th>
+<th>Severity</th><th>Status</th><th>Account</th><th>Type</th><th>RC4 Seen</th>
+<th>Service Principal Names</th><th>Available Keys</th><th>msDS-SupportedEncryptionTypes</th>
+<th>Advertised Etypes</th><th>Requester → Advertised Etypes</th>
+<th>Observed Ticket Encryption</th><th>Observed Session Encryption</th>
+<th>RC4 TGS</th><th>RC4 AS</th><th>Requesting Principals</th><th>Last Seen</th>
+<th>Evidence / Finding</th><th>Recommendation</th>
 </tr></thead><tbody>
 $($rows -join "`n")
 </tbody></table></div>
+</div>
 
 <div class="section">
-<h2>Classification logic</h2>
+<h2>Classification legend</h2>
+<div class="note"><b>Important:</b> The underlying telemetry comes from Microsoft Kerberos Security Events and Active Directory attributes. The severity labels below are this tool's simplified operational prioritization model.</div>
 <div class="tablewrap"><table class="smalltable">
-<thead><tr><th>Observed / configured condition</th><th>Priority</th><th>Operational meaning</th></tr></thead>
+<thead><tr><th>Priority</th><th>Rule</th><th>Operational meaning</th></tr></thead>
 <tbody>
-<tr><td>RC4 TGS attributed to target + modern Available Keys telemetry does not demonstrate AES keys</td><td><span class='badge sev-critical'>Critical</span></td><td>Active RC4 dependency with missing/undemonstrated AES key capability; validate and restore AES capability before removing RC4.</td></tr>
-<tr><td>RC4 TGS attributed to target + AES keys present</td><td><span class='badge sev-high'>High</span></td><td>RC4 is actively selected even though AES capability exists; investigate service configuration, SPN, requester and application path.</td></tr>
-<tr><td>RC4 AS authentication observed</td><td><span class='badge sev-high'>High</span></td><td>Active RC4 authentication evidence requiring investigation.</td></tr>
-<tr><td>Non-computer SPN account explicitly allows RC4, no RC4 TGS observed</td><td><span class='badge sev-medium'>Medium</span></td><td>Potential service dependency; validate AES before removing explicit RC4 support.</td></tr>
-<tr><td>Computer supports RC4 + AES, only AES observed</td><td><span class='badge sev-informational'>Informational</span></td><td>Capability/configuration only; no active RC4 dependency observed.</td></tr>
-<tr><td>Explicit AES-only configuration, no RC4 observed</td><td><span class='badge sev-healthy'>Healthy</span></td><td>No RC4 remediation identified from the observed evidence.</td></tr>
+<tr><td><span class='badge sev-high'>High</span></td><td><b>RC4 observed in Event 4768 or 4769.</b></td><td>An active RC4 dependency was observed and requires investigation.</td></tr>
+<tr><td><span class='badge sev-medium'>Medium</span></td><td><b>msDS-SupportedEncryptionTypes allows RC4, but no RC4 activity was observed.</b></td><td>Review whether RC4 can be removed after compatibility testing.</td></tr>
+<tr><td><span class='badge sev-healthy'>Healthy</span></td><td><b>AES capability or usage was observed and no RC4 activity was found.</b></td><td>No current RC4 remediation is identified from the selected window.</td></tr>
+<tr><td><span class='badge sev-informational'>Informational</span></td><td><b>No RC4 observed, but available evidence is insufficient for another classification.</b></td><td>Continue monitoring or gather enhanced telemetry.</td></tr>
 </tbody></table></div>
 </div>
 
@@ -1011,29 +1568,87 @@ $($rows -join "`n")
 </div>
 
 <div class="section"><h2>Collection health</h2>
-<p>Security events read: <b>$totalEvents</b> &nbsp; | &nbsp; Modern-schema: <b>$modernEvents</b> &nbsp; | &nbsp; Legacy-schema: <b>$legacyEvents</b> &nbsp; | &nbsp; KDCSVC 201-209: <b>$($kdcEvents.Count)</b></p>
+<p>Compatibility is detected from event fields, allowing mixed forests with legacy and enhanced KDC schemas. Security events read: <b>$totalEvents</b> &nbsp; | &nbsp; Modern-schema: <b>$modernEvents</b> &nbsp; | &nbsp; Legacy-schema: <b>$legacyEvents</b> &nbsp; | &nbsp; KDCSVC 201-209: <b>$($kdcEvents.Count)</b></p>
 <div class="tablewrap"><table class="smalltable"><thead><tr><th>Domain Controller</th><th>Error</th></tr></thead><tbody>$errorRows</tbody></table></div>
 </div>
 
 <footer>
-Generated by <b>KerberosRC4Assessment</b>. Read-only assessment. No Active Directory, SPN, GPO, password, registry, or Kerberos-policy changes are performed.<br>
-Correlation model is based on Microsoft Kerberos Security Event telemetry and the Microsoft Kerberos-Crypto Get-KerbEncryptionUsage.ps1 / List-AccountKeys.ps1 assessment approach. KDCSVC 201-209 are supplementary evidence for CVE-2026-20833 readiness.
+Evidence correlation is based on Microsoft Kerberos Security Event telemetry and the Microsoft Kerberos-Crypto Get-KerbEncryptionUsage.ps1 / List-AccountKeys.ps1 approach. Severity labels are this tool's simplified operational prioritization model, not official Microsoft severity ratings. KDCSVC 201-209 are supplementary evidence for CVE-2026-20833 readiness.
 </footer>
 </div>
 <script>
-let currentFilter='ACTION';
+let currentStatusFilter='Enabled';
+let currentSeverityFilter='ALL';
 const q=document.getElementById('q');
 q.addEventListener('input',apply);
-window.addEventListener('DOMContentLoaded',apply);
-function setFilter(f){currentFilter=f;apply()}
+window.addEventListener('DOMContentLoaded',()=>{
+ apply();
+ initializeHorizontalScrollbars();
+});
+
+# Implements the initializeHorizontalScrollbars helper.
+function initializeHorizontalScrollbars(){
+ const top=document.getElementById('mainScrollTop');
+ const topInner=document.getElementById('mainScrollTopInner');
+ const bottom=document.getElementById('mainScrollBottom');
+ const table=document.getElementById('main');
+
+ if(!top||!topInner||!bottom||!table){return;}
+
+ const updateWidth=()=>{
+  topInner.style.width=table.scrollWidth+'px';
+ };
+
+ let syncing=false;
+
+ top.addEventListener('scroll',()=>{
+  if(syncing){return;}
+  syncing=true;
+  bottom.scrollLeft=top.scrollLeft;
+  syncing=false;
+ });
+
+ bottom.addEventListener('scroll',()=>{
+  if(syncing){return;}
+  syncing=true;
+  top.scrollLeft=bottom.scrollLeft;
+  syncing=false;
+ });
+
+ updateWidth();
+ window.addEventListener('resize',updateWidth);
+}
+
+# Implements the setStatusFilter helper.
+function setStatusFilter(value){
+ currentStatusFilter=value;
+ apply();
+}
+
+# Implements the setSeverityFilter helper.
+function setSeverityFilter(value){
+ currentSeverityFilter=value;
+ apply();
+}
+
+# Implements the apply helper.
 function apply(){
  const term=q.value.toLowerCase();
+
  document.querySelectorAll('#main tbody tr').forEach(r=>{
   let ok=r.innerText.toLowerCase().includes(term);
-  if(['Critical','High','Medium'].includes(currentFilter)) ok=ok&&r.dataset.severity===currentFilter;
-  else if(currentFilter==='RC4') ok=ok&&r.dataset.rc4==='True';
-  else if(currentFilter==='ACTION') ok=ok&&r.dataset.action==='True';
-  else if(currentFilter==='INFO') ok=ok&&(r.dataset.severity==='Healthy'||r.dataset.severity==='Informational');
+
+  if(currentStatusFilter!=='ALL'){
+   ok=ok&&r.dataset.status===currentStatusFilter;
+  }
+
+  if(currentSeverityFilter==='RC4'){
+   ok=ok&&r.dataset.rc4==='True';
+  }
+  else if(currentSeverityFilter!=='ALL'){
+   ok=ok&&r.dataset.severity===currentSeverityFilter;
+  }
+
   r.style.display=ok?'':'none';
  });
 }
@@ -1044,15 +1659,16 @@ function apply(){
 $html | Set-Content $htmlPath -Encoding UTF8
 
 Write-Host ""
-Write-Host "=== Kerberos RC4 Assessment v1.7.2 Production Final ===" -ForegroundColor White
+Write-Host "=== Kerberos RC4 Assessment v5.1 Final ===" -ForegroundColor White
 Write-Host "Security events read         : $totalEvents"
 Write-Host "Modern-schema events         : $modernEvents"
 Write-Host "Legacy-schema events         : $legacyEvents"
 Write-Host "KDCSVC 201-209 events        : $($kdcEvents.Count)"
 Write-Host "Accounts in report           : $($results.Count)"
-Write-Host "Accounts needing action      : $($action.Count)"
-Write-Host "Attributed RC4 usage         : $actualRC4"
-Write-Host "Critical                     : $critical"
+Write-Host "Enabled accounts needing action : $($action.Count)"
+Write-Host "Enabled accounts with RC4       : $actualRC4"
+Write-Host "Disabled accounts                : $($disabledResults.Count)"
+Write-Host "Disabled with recent RC4         : $($disabledRecentRC4.Count)"
 Write-Host "High                         : $high"
 Write-Host "Medium                       : $medium"
 Write-Host "Healthy / Informational      : $($healthy+$info)"
