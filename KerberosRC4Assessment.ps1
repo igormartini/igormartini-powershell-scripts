@@ -11,7 +11,7 @@
 .NOTES
     Author  : Igor Henrique Martini
     Website : https://igormartini.cloud
-    Version: 5.1.1 Final
+    Version: 5.2.1 Final
     Target execution platform: Windows 10 or Windows 11 with Windows PowerShell 5.1
     Supported Domain Controller event sources: Windows Server 2008 R2 through Windows Server 2025+
 
@@ -67,7 +67,7 @@ function Convert-ToHtmlRecordLines {
     )
 
     if ([string]::IsNullOrWhiteSpace($Value)) {
-        return '—'
+        return '&mdash;'
     }
 
     $items = @(
@@ -77,7 +77,7 @@ function Convert-ToHtmlRecordLines {
     )
 
     if ($items.Count -eq 0) {
-        return '—'
+        return '&mdash;'
     }
 
     return (
@@ -96,7 +96,7 @@ function Convert-ToHtmlEncryptionTags {
     param([AllowNull()][string]$Value)
 
     if ([string]::IsNullOrWhiteSpace($Value)) {
-        return '—'
+        return '&mdash;'
     }
 
     $items = @(
@@ -106,7 +106,7 @@ function Convert-ToHtmlEncryptionTags {
     )
 
     if ($items.Count -eq 0) {
-        return '—'
+        return '&mdash;'
     }
 
     return (
@@ -136,7 +136,7 @@ function Convert-ToHtmlRequesterEtypeMap {
     param([AllowNull()][string]$Value)
 
     if ([string]::IsNullOrWhiteSpace($Value)) {
-        return '—'
+        return '&mdash;'
     }
 
     $records = @(
@@ -672,7 +672,72 @@ function Get-ADPrincipal {
     } catch { $null }
 }
 
-# Assigns severity, finding, and recommendation.
+# Builds a contextual remediation recommendation from the observed evidence.
+function Get-ContextualRecommendation {
+    param(
+        [bool]$RC4TgsObserved,
+        [bool]$RC4AsObserved,
+        [bool]$HasAESKeyEvidence,
+        [bool]$ExplicitRC4,
+        [bool]$ExplicitAES,
+        [bool]$ZeroEncryptionTypes,
+        [ValidateSet('User','Service','Computer')]
+        [string]$AccountType
+    )
+
+    $actions = New-Object 'System.Collections.Generic.List[string]'
+    $hasConfiguredOrObservedAES = $HasAESKeyEvidence -or $ExplicitAES
+
+    if ($RC4TgsObserved -and $RC4AsObserved) {
+        $actions.Add('Investigate both the RC4 authentication requests and RC4 service-ticket activity associated with this principal.')
+    }
+    elseif ($RC4TgsObserved) {
+        $actions.Add('Identify the service and requesting principals responsible for the RC4 service tickets.')
+    }
+    elseif ($RC4AsObserved) {
+        $actions.Add('Identify the client, device, or account generating RC4 authentication requests.')
+    }
+
+    if (-not $hasConfiguredOrObservedAES) {
+        $actions.Add('Reset the account password through the approved change process to generate AES keys, then verify that the account has usable AES key material.')
+    }
+    elseif ($RC4TgsObserved -and $AccountType -eq 'Service') {
+        $actions.Add('Verify that the service account has valid AES keys; reset its password if the required AES keys are missing or stale.')
+    }
+
+    if ($ZeroEncryptionTypes) {
+        $actions.Add('Review the zero-valued msDS-SupportedEncryptionTypes configuration and explicitly configure the required AES encryption types after compatibility validation.')
+    }
+    elseif ($ExplicitRC4) {
+        $actions.Add('Review msDS-SupportedEncryptionTypes and retain the required AES types; remove the RC4 bit only after compatibility testing succeeds.')
+    }
+
+    switch ($AccountType) {
+        'Service' {
+            $actions.Add('Validate that the application, service, and every dependent client support AES before changing the production configuration.')
+        }
+        'Computer' {
+            $actions.Add('Verify the operating system, machine-account configuration, and Kerberos policy of the device, then confirm that machine authentication negotiates AES.')
+        }
+        'User' {
+            $actions.Add('Verify the client configuration and any applications using this identity, then confirm that subsequent Kerberos authentications negotiate AES.')
+        }
+    }
+
+    if ($RC4TgsObserved -and $RC4AsObserved) {
+        $actions.Add('Re-audit Events 4768 and 4769 and confirm that both authentication requests and service tickets use AES before removing the remaining RC4 dependency.')
+    }
+    elseif ($RC4TgsObserved) {
+        $actions.Add('Request new service tickets and confirm in Event 4769 that AES is negotiated before removing RC4 support.')
+    }
+    elseif ($RC4AsObserved) {
+        $actions.Add('Repeat authentication and confirm in Event 4768 that AES is negotiated before removing RC4 support.')
+    }
+
+    ($actions | Select-Object -Unique) -join ' '
+}
+
+# Assigns severity, finding, and a contextual recommendation.
 function Get-Classification {
     param(
         [bool]$RC4TgsObserved,
@@ -681,7 +746,10 @@ function Get-Classification {
         [bool]$AESSessionObserved,
         [bool]$HasAESKeyEvidence,
         [bool]$ExplicitRC4,
-        [bool]$ExplicitAES
+        [bool]$ExplicitAES,
+        [bool]$ZeroEncryptionTypes,
+        [ValidateSet('User','Service','Computer')]
+        [string]$AccountType
     )
 
     $observedRC4 = $RC4TgsObserved -or $RC4AsObserved
@@ -698,20 +766,43 @@ function Get-Classification {
             'Event 4768: RC4 authentication activity observed.'
         }
 
+        if ($ZeroEncryptionTypes) {
+            $finding += ' AD attribute: msDS-SupportedEncryptionTypes is configured as 0 (Unset).'
+        }
+
         return [pscustomobject]@{
             Severity='High'
             NeedsAction=$true
             Finding=$finding
-            Recommendation='Investigate the accounts, services, and requesting systems still using RC4. Confirm AES support, update the account or device configuration where appropriate, re-audit Events 4768/4769, and remove RC4 only after successful compatibility testing.'
+            Recommendation=Get-ContextualRecommendation `
+                -RC4TgsObserved $RC4TgsObserved `
+                -RC4AsObserved $RC4AsObserved `
+                -HasAESKeyEvidence $HasAESKeyEvidence `
+                -ExplicitRC4 $ExplicitRC4 `
+                -ExplicitAES $ExplicitAES `
+                -ZeroEncryptionTypes $ZeroEncryptionTypes `
+                -AccountType $AccountType
         }
     }
 
     if ($ExplicitRC4) {
+        $typeGuidance = switch ($AccountType) {
+            'Service' {
+                'Validate the service and all dependent applications with AES before changing the account configuration.'
+            }
+            'Computer' {
+                'Verify the operating system and machine-account Kerberos configuration, then confirm that device authentication uses AES.'
+            }
+            default {
+                'Verify the client and application configuration, then confirm that future Kerberos authentications use AES.'
+            }
+        }
+
         return [pscustomobject]@{
             Severity='Medium'
             NeedsAction=$true
             Finding='AD attribute: msDS-SupportedEncryptionTypes allows RC4; no RC4 activity was observed in the selected window.'
-            Recommendation='Validate that the account, service, and requesting clients operate with AES. After testing, remove the RC4 bit from msDS-SupportedEncryptionTypes while retaining the required AES types, then monitor Events 4768/4769 for failures.'
+            Recommendation=("RC4 is permitted but was not observed during the assessment window. Review whether RC4 is still required. {0} After successful compatibility validation, remove the RC4 bit from msDS-SupportedEncryptionTypes while retaining the required AES types, then monitor Events 4768/4769 for authentication failures or renewed RC4 activity." -f $typeGuidance)
         }
     }
 
@@ -720,7 +811,7 @@ function Get-Classification {
             Severity='Healthy'
             NeedsAction=$false
             Finding='Events or account evidence show AES capability or usage; no RC4 activity was observed in the selected window.'
-            Recommendation='No RC4 remediation is currently required. Continue periodic monitoring to confirm that Kerberos authentication remains on AES.'
+            Recommendation='No RC4 remediation is currently required. Continue periodic monitoring to confirm that Kerberos authentication remains on AES and that RC4 is not reintroduced.'
         }
     }
 
@@ -728,7 +819,7 @@ function Get-Classification {
         Severity='Informational'
         NeedsAction=$false
         Finding='No RC4 activity was observed, but the available event and account evidence is insufficient for a stronger conclusion.'
-        Recommendation='Continue monitoring Events 4768/4769 and review Available Keys and msDS-SupportedEncryptionTypes when additional validation is required.'
+        Recommendation='Continue monitoring Events 4768/4769. Review Available Keys, msDS-SupportedEncryptionTypes, password age, application compatibility, and client behavior before making an encryption-policy change.'
     }
 }
 
@@ -793,7 +884,7 @@ foreach ($dc in $dcs) {
             )
 
             # ------------------------------------------------------------
-            # LEGACY COLLECTOR — Windows PowerShell 2.0 / Server 2008 R2
+            # LEGACY COLLECTOR - Windows PowerShell 2.0 / Server 2008 R2
             # ------------------------------------------------------------
             # PowerShell 2.0 does not reliably support the modern
             # EventLogPropertySelector path or FilterHashtable behavior used by
@@ -882,7 +973,7 @@ foreach ($dc in $dcs) {
             }
 
             # ------------------------------------------------------------
-            # MODERN COLLECTOR — PowerShell 3.0+
+            # MODERN COLLECTOR - PowerShell 3.0+
             # ------------------------------------------------------------
 
             # Resolve the required EventData fields by NAME rather than by Properties[]
@@ -1236,6 +1327,19 @@ foreach ($entry in $states.GetEnumerator()) {
 
     $spns = @($ad.servicePrincipalName)
     $hasSPN = $spns.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace(($spns -join ''))
+    $zeroEncryptionTypes = (
+        $null -ne $ad.'msDS-SupportedEncryptionTypes' -and
+        [int64]$ad.'msDS-SupportedEncryptionTypes' -eq 0
+    )
+    $accountType = if ([string]$ad.objectClass -eq 'computer') {
+        'Computer'
+    }
+    elseif ($hasSPN) {
+        'Service'
+    }
+    else {
+        'User'
+    }
 
     $class = Get-Classification `
         -RC4TgsObserved ($s.RC4TgsTargetCount -gt 0) `
@@ -1244,7 +1348,9 @@ foreach ($entry in $states.GetEnumerator()) {
         -AESSessionObserved ($s.AESSessionCount -gt 0) `
         -HasAESKeyEvidence $hasAESKey `
         -ExplicitRC4 $enc.RC4 `
-        -ExplicitAES $explicitAES
+        -ExplicitAES $explicitAES `
+        -ZeroEncryptionTypes $zeroEncryptionTypes `
+        -AccountType $accountType
 
     $pwdLastSet = $null
     if ($ad.pwdLastSet -and [int64]$ad.pwdLastSet -gt 0) {
@@ -1256,7 +1362,7 @@ foreach ($entry in $states.GetEnumerator()) {
         NeedsAction=$class.NeedsAction
         Status=$status
         Account=$s.Name
-        AccountType=if([string]$ad.objectClass -eq 'computer'){'Computer'}elseif($hasSPN){'Service'}else{'User'}
+        AccountType=$accountType
         RC4Seen=if(($s.RC4TgsTargetCount -gt 0) -or ($s.RC4AsCount -gt 0)){'Yes'}else{'No'}
         SamAccountName=[string]$ad.sAMAccountName
         UserPrincipalName=[string]$ad.userPrincipalName
@@ -1538,7 +1644,7 @@ footer{color:var(--muted);font-size:11px;margin-top:18px;line-height:1.5}
 <thead><tr>
 <th>Severity</th><th>Status</th><th>Account</th><th>Type</th><th>RC4 Seen</th>
 <th>Service Principal Names</th><th>Available Keys</th><th>msDS-SupportedEncryptionTypes</th>
-<th>Advertised Etypes</th><th>Requester → Advertised Etypes</th>
+<th>Advertised Etypes</th><th>Requester &rarr; Advertised Etypes</th>
 <th>Observed Ticket Encryption</th><th>Observed Session Encryption</th>
 <th>RC4 TGS</th><th>RC4 AS</th><th>Requesting Principals</th><th>Last Seen</th>
 <th>Evidence / Finding</th><th>Recommendation</th>
@@ -1561,7 +1667,7 @@ $($rows -join "`n")
 </div>
 
 <div class="section">
-<h2>KDCSVC 201-209 — enforcement readiness</h2>
+<h2>KDCSVC 201-209 &mdash; enforcement readiness</h2>
 <div class="note">Microsoft's CVE-2026-20833 deployment guidance recommends monitoring KDCSVC Events 201-209 in the <b>System</b> log. These events are shown as supplementary evidence because they describe audit/enforcement compatibility conditions and are not a substitute for 4768/4769 usage attribution.</div>
 <div class="tablewrap"><table class="kdc-table">
 <thead><tr><th>Event ID</th><th>Level</th><th>Domain Controller</th><th>Time</th><th>Event summary</th></tr></thead>
@@ -1574,7 +1680,7 @@ $($rows -join "`n")
 </div>
 
 <footer>
-Evidence correlation is based on Microsoft Kerberos Security Event telemetry and the Microsoft Kerberos-Crypto Get-KerbEncryptionUsage.ps1 / List-AccountKeys.ps1 approach. Severity labels are this tool's simplified operational prioritization model, not official Microsoft severity ratings. KDCSVC 201-209 are supplementary evidence for CVE-2026-20833 readiness.
+Evidence correlation is based on Microsoft Kerberos Security Event telemetry and the Microsoft Kerberos-Crypto Get-KerbEncryptionUsage.ps1 / List-AccountKeys.ps1 approach. Severity labels are this tool's simplified operational prioritization model, not official Microsoft severity ratings. Recommendations are generated from the observed Kerberos evidence, Active Directory configuration, AES-key evidence, and account type; validate every change against application-specific compatibility and organizational change-control requirements. KDCSVC 201-209 are supplementary evidence for CVE-2026-20833 readiness.
 </footer>
 </div>
 <script>
@@ -1679,7 +1785,7 @@ function apply(){
 $html | Set-Content $htmlPath -Encoding UTF8
 
 Write-Host ""
-Write-Host "=== Kerberos RC4 Assessment v5.1.1 Final ===" -ForegroundColor White
+Write-Host "=== Kerberos RC4 Assessment v5.2.1 Final ===" -ForegroundColor White
 Write-Host "Security events read         : $totalEvents"
 Write-Host "Modern-schema events         : $modernEvents"
 Write-Host "Legacy-schema events         : $legacyEvents"
