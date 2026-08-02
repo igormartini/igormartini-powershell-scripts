@@ -11,7 +11,7 @@
 .NOTES
     Author  : Igor Henrique Martini
     Website : https://igormartini.cloud
-    Version: 5.1 Final
+    Version: 5.1.1 Final
     Target execution platform: Windows 10 or Windows 11 with Windows PowerShell 5.1
     Supported Domain Controller event sources: Windows Server 2008 R2 through Windows Server 2025+
 
@@ -1438,6 +1438,7 @@ body{margin:0;font-family:"Segoe UI",Arial,sans-serif;background:var(--bg);color
 .controls{background:#fff;border:1px solid var(--border);border-radius:14px;padding:13px 16px;display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
 input{min-width:360px;flex:1;border:1px solid #c9d3df;border-radius:8px;padding:9px 11px;background:#fff}
 button{border:1px solid #c9d3df;background:#fff;border-radius:8px;padding:8px 12px;cursor:pointer;color:#344054}button:hover{background:#f4f7fa}
+button.active-filter{background:#e8f1fa;border-color:#1e73b7;color:#0f4c78;font-weight:700}
 .table-scroll-shell{width:100%}
 .table-scroll-top{width:100%;overflow-x:auto;overflow-y:hidden;height:18px;margin-bottom:6px}
 .table-scroll-top-inner{height:1px}
@@ -1519,16 +1520,16 @@ footer{color:var(--muted);font-size:11px;margin-top:18px;line-height:1.5}
 <div class="controls">
  <input id="q" type="search" placeholder="Search account, SPN, requester, encryption, evidence or recommendation...">
  <span class="sub"><b>Status:</b></span>
- <button onclick="setStatusFilter('Enabled')">Enabled</button>
- <button onclick="setStatusFilter('Disabled')">Disabled</button>
- <button onclick="setStatusFilter('ALL')">All</button>
+ <button data-filter-group="status" data-filter-value="Enabled" onclick="setStatusFilter('Enabled')">Enabled</button>
+ <button data-filter-group="status" data-filter-value="Disabled" onclick="setStatusFilter('Disabled')">Disabled</button>
+ <button data-filter-group="status" data-filter-value="ALL" onclick="setStatusFilter('ALL')">All</button>
  <span class="sub"><b>Severity:</b></span>
- <button onclick="setSeverityFilter('ALL')">All severities</button>
- <button onclick="setSeverityFilter('High')">High</button>
- <button onclick="setSeverityFilter('Medium')">Medium</button>
- <button onclick="setSeverityFilter('Healthy')">Healthy</button>
- <button onclick="setSeverityFilter('Informational')">Informational</button>
- <button onclick="setSeverityFilter('RC4')">RC4 observed</button>
+ <button data-filter-group="severity" data-filter-value="ALL" onclick="setSeverityFilter('ALL')">All severities</button>
+ <button data-filter-group="severity" data-filter-value="High" onclick="setSeverityFilter('High')">High</button>
+ <button data-filter-group="severity" data-filter-value="Medium" onclick="setSeverityFilter('Medium')">Medium</button>
+ <button data-filter-group="severity" data-filter-value="Healthy" onclick="setSeverityFilter('Healthy')">Healthy</button>
+ <button data-filter-group="severity" data-filter-value="Informational" onclick="setSeverityFilter('Informational')">Informational</button>
+ <button data-filter-group="severity" data-filter-value="RC4" onclick="setSeverityFilter('RC4')">RC4 observed</button>
 </div>
 
 <div class="table-scroll-shell">
@@ -1579,14 +1580,19 @@ Evidence correlation is based on Microsoft Kerberos Security Event telemetry and
 <script>
 let currentStatusFilter='Enabled';
 let currentSeverityFilter='ALL';
-const q=document.getElementById('q');
-q.addEventListener('input',apply);
+let q=null;
+
 window.addEventListener('DOMContentLoaded',()=>{
+ q=document.getElementById('q');
+ if(q){
+  q.addEventListener('input',apply);
+ }
  apply();
  initializeHorizontalScrollbars();
+ updateFilterButtons();
 });
 
-# Implements the initializeHorizontalScrollbars helper.
+// Initializes synchronized horizontal scrollbars.
 function initializeHorizontalScrollbars(){
  const top=document.getElementById('mainScrollTop');
  const topInner=document.getElementById('mainScrollTopInner');
@@ -1619,21 +1625,35 @@ function initializeHorizontalScrollbars(){
  window.addEventListener('resize',updateWidth);
 }
 
-# Implements the setStatusFilter helper.
+// Applies the selected account-status filter.
 function setStatusFilter(value){
  currentStatusFilter=value;
  apply();
+ updateFilterButtons();
 }
 
-# Implements the setSeverityFilter helper.
+// Applies the selected severity filter.
 function setSeverityFilter(value){
  currentSeverityFilter=value;
  apply();
+ updateFilterButtons();
 }
 
-# Implements the apply helper.
+// Highlights the currently selected status and severity filters.
+function updateFilterButtons(){
+ document.querySelectorAll('button[data-filter-group]').forEach(button=>{
+  const group=button.dataset.filterGroup;
+  const value=button.dataset.filterValue;
+  const active=
+   (group==='status'&&value===currentStatusFilter)||
+   (group==='severity'&&value===currentSeverityFilter);
+  button.classList.toggle('active-filter',active);
+ });
+}
+
+// Applies search, status, and severity filters to the result table.
 function apply(){
- const term=q.value.toLowerCase();
+ const term=q ? q.value.toLowerCase() : '';
 
  document.querySelectorAll('#main tbody tr').forEach(r=>{
   let ok=r.innerText.toLowerCase().includes(term);
@@ -1659,7 +1679,7 @@ function apply(){
 $html | Set-Content $htmlPath -Encoding UTF8
 
 Write-Host ""
-Write-Host "=== Kerberos RC4 Assessment v5.1 Final ===" -ForegroundColor White
+Write-Host "=== Kerberos RC4 Assessment v5.1.1 Final ===" -ForegroundColor White
 Write-Host "Security events read         : $totalEvents"
 Write-Host "Modern-schema events         : $modernEvents"
 Write-Host "Legacy-schema events         : $legacyEvents"
