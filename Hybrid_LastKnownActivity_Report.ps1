@@ -4,9 +4,10 @@
     and Microsoft Entra ID sign-in information.
 
 .DESCRIPTION
-    This script retrieves the most recent Active Directory lastLogon
-    value across all Domain Controllers and compares it with Microsoft
-    Entra ID lastSuccessfulSignInDateTime.
+    This script retrieves the Active Directory lastLogon value from each
+    Domain Controller in the user's domain, identifies the most recent AD
+    value, and compares it with Microsoft Entra ID
+    lastSuccessfulSignInDateTime.
 
     The report generates:
     - CSV output
@@ -59,15 +60,25 @@ Write-Progress -Id 1 -Activity "Microsoft Graph" -Status "Connected successfully
 Start-Sleep -Milliseconds 400
 Write-Progress -Id 1 -Activity "Microsoft Graph" -Completed
 
-# Retrieve all Domain Controllers from the current domain
-Write-Progress -Id 2 -Activity "Active Directory" -Status "Retrieving Domain Controllers..." -PercentComplete 10
+# Retrieve all domains and Domain Controllers from the current forest
+Write-Progress -Id 2 -Activity "Active Directory" -Status "Retrieving forest domains and Domain Controllers..." -PercentComplete 10
 
-$DomainControllers = Get-ADDomainController -Filter * |
-    Select-Object -ExpandProperty HostName
+$Forest = Get-ADForest
+$DomainControllersByDomain = @{}
+$AllDomainControllers = @()
 
-$DomainControllerList = ($DomainControllers | Sort-Object) -join ", "
+foreach ($Domain in $Forest.Domains) {
+    $DCs = Get-ADDomainController -Filter * -Server $Domain |
+        Select-Object -ExpandProperty HostName |
+        Sort-Object
 
-Write-Progress -Id 2 -Activity "Active Directory" -Status "Domain Controllers retrieved." -PercentComplete 100
+    $DomainControllersByDomain[$Domain.ToLower()] = @($DCs)
+    $AllDomainControllers += $DCs
+}
+
+$DomainControllerList = ($AllDomainControllers | Sort-Object -Unique) -join ", "
+
+Write-Progress -Id 2 -Activity "Active Directory" -Status "Forest Domain Controllers retrieved." -PercentComplete 100
 Start-Sleep -Milliseconds 400
 Write-Progress -Id 2 -Activity "Active Directory" -Completed
 
@@ -114,28 +125,33 @@ function Get-ActivityStatus {
     }
 }
 
-# Retrieves the most recent lastLogon value across all Domain Controllers
-function Get-MostRecentLastLogon {
+# Retrieves lastLogon from every Domain Controller in the user's AD domain.
+# The function returns both the per-DC values and the most recent value, which
+# is used later to calculate Last Known Activity.
+function Get-LastLogonAcrossDCs {
     param(
         [string]$SamAccountName,
+        [string]$SourceDomain,
         [int]$UserIndex,
         [int]$TotalUsers
     )
 
-    $Logons = @()
+    $Results = @()
     $DcIndex = 0
+    $DomainKey = $SourceDomain.ToLower()
+    $DomainControllers = @($DomainControllersByDomain[$DomainKey])
 
     foreach ($DC in $DomainControllers) {
 
         $DcIndex++
 
-        $OverallPercent = [int](($UserIndex / $TotalUsers) * 100)
-        $DcPercent      = [int](($DcIndex / $DomainControllers.Count) * 100)
+        $OverallPercent = if ($TotalUsers -gt 0) { [int](($UserIndex / $TotalUsers) * 100) } else { 100 }
+        $DcPercent      = if ($DomainControllers.Count -gt 0) { [int](($DcIndex / $DomainControllers.Count) * 100) } else { 100 }
 
         Write-Progress `
             -Id 3 `
             -Activity "Scanning Active Directory lastLogon across all Domain Controllers" `
-            -Status "User $UserIndex of $TotalUsers - $SamAccountName" `
+            -Status "User $UserIndex of $TotalUsers - $SamAccountName ($SourceDomain)" `
             -PercentComplete $OverallPercent
 
         Write-Progress `
@@ -145,32 +161,61 @@ function Get-MostRecentLastLogon {
             -Status "Scanning $DC ($DcIndex of $($DomainControllers.Count))" `
             -PercentComplete $DcPercent
 
+        $ConvertedDate = $null
+        $QueryStatus = "OK"
+
         try {
             $User = Get-ADUser `
                 -Server $DC `
                 -Identity $SamAccountName `
-                -Properties LastLogon
+                -Properties LastLogon `
+                -ErrorAction Stop
 
             $ConvertedDate = Convert-ADFileTime $User.LastLogon
 
-            if ($null -ne $ConvertedDate) {
-                $Logons += $ConvertedDate
-            }
+										   
+										 
+			 
         }
         catch {
-            continue
+            $QueryStatus = "Query Failed"
+        }
+
+        $Results += [PSCustomObject]@{
+            Domain    = $SourceDomain
+            DC        = $DC
+            LastLogon = $ConvertedDate
+            Status    = $QueryStatus
         }
     }
 
     Write-Progress -Id 4 -ParentId 3 -Activity "Current Domain Controller" -Completed
 
-    if ($Logons.Count -gt 0) {
-        return $Logons |
-            Sort-Object -Descending |
-            Select-Object -First 1
-    }
+    $MostRecent = $Results |
+        Where-Object { $null -ne $_.LastLogon } |
+        Sort-Object LastLogon -Descending |
+        Select-Object -First 1 -ExpandProperty LastLogon
+	 
 
-    return $null
+    # Single text value for CSV output. The HTML report renders the same
+    # information on separate lines for readability.
+    $PerDcText = ($Results | ForEach-Object {
+        if ($_.Status -ne "OK") {
+            "$($_.DC): Query Failed"
+        }
+        elseif ($null -eq $_.LastLogon) {
+            "$($_.DC): Never"
+        }
+        else {
+            "$($_.DC): $(Format-Date $_.LastLogon)"
+        }
+    }) -join " | "
+
+    return [PSCustomObject]@{
+        MostRecent = $MostRecent
+        PerDC       = $Results
+        PerDCText   = $PerDcText
+    }
 }
 
 # Retrieve Microsoft Entra ID users and sign-in activity
@@ -202,21 +247,33 @@ foreach ($User in $EntraUsers) {
     }
 }
 
-# Retrieve all enabled Active Directory users
+# Retrieve all enabled Active Directory users from every domain in the forest
 Write-Progress `
     -Id 6 `
     -Activity "Active Directory" `
-    -Status "Retrieving enabled AD users..." `
+    -Status "Retrieving enabled AD users from all forest domains..." `
     -PercentComplete 40
 
-$ADUsers = Get-ADUser `
-    -Filter 'Enabled -eq $true' `
-    -Properties UserPrincipalName
+$ADUsers = @()
+								 
+								 
+
+foreach ($Domain in $Forest.Domains) {
+    $DomainUsers = Get-ADUser `
+        -Server $Domain `
+        -Filter 'Enabled -eq $true' `
+        -Properties UserPrincipalName
+
+    foreach ($DomainUser in $DomainUsers) {
+        $DomainUser | Add-Member -NotePropertyName SourceDomain -NotePropertyValue $Domain -Force
+        $ADUsers += $DomainUser
+    }
+}
 
 Write-Progress `
     -Id 6 `
     -Activity "Active Directory" `
-    -Status "Enabled AD users retrieved." `
+    -Status "Enabled AD users retrieved from all forest domains." `
     -PercentComplete 100
 
 Start-Sleep -Milliseconds 400
@@ -239,11 +296,14 @@ foreach ($ADUser in $ADUsers) {
         $CloudUser = $EntraLookup[$UPN.ToLower()]
     }
 
-    # Retrieve the most recent AD lastLogon across all Domain Controllers
-    $ADLastLogon = Get-MostRecentLastLogon `
+    # Retrieve lastLogon from each DC in the user's AD domain
+    $ADLogonResult = Get-LastLogonAcrossDCs `
         -SamAccountName $ADUser.SamAccountName `
+        -SourceDomain $ADUser.SourceDomain `
         -UserIndex $UserIndex `
         -TotalUsers $TotalADUsers
+
+    $ADLastLogon = $ADLogonResult.MostRecent
 
     # Retrieve the last successful Microsoft Entra ID sign-in
     $EntraLastSuccessful = $null
@@ -278,7 +338,7 @@ foreach ($ADUser in $ADUsers) {
     $Report += [PSCustomObject]@{
         DisplayName               = $ADUser.Name
         UserPrincipalName          = $UPN
-        AD_LastLogon_AllDCs        = $ADLastLogon
+        AD_LastLogon_AllDCs        = $ADLogonResult.PerDCText
         Entra_LastSuccessfulSignIn = $EntraLastSuccessful
         LastKnownActivity          = $LastKnownActivity
         ActivityStatus             = Get-ActivityStatus $LastKnownActivity
@@ -287,8 +347,16 @@ foreach ($ADUser in $ADUsers) {
 
 Write-Progress -Id 3 -Activity "Scanning Active Directory lastLogon across all Domain Controllers" -Completed
 
-# Export detailed results to CSV
-$Report | Export-Csv $CsvPath -NoTypeInformation -Encoding UTF8
+# Export detailed results to CSV using the requested column order
+$Report |
+    Select-Object `
+        DisplayName,
+        UserPrincipalName,
+        AD_LastLogon_AllDCs,
+        Entra_LastSuccessfulSignIn,
+        LastKnownActivity,
+        ActivityStatus |
+    Export-Csv $CsvPath -NoTypeInformation -Encoding UTF8
 
 # Calculate executive summary metrics
 $TotalUsers = $Report.Count
@@ -314,7 +382,7 @@ foreach ($Item in ($Report | Sort-Object LastKnownActivity -Descending)) {
 <tr data-status="$($Item.ActivityStatus)">
 <td>$($Item.DisplayName)</td>
 <td>$($Item.UserPrincipalName)</td>
-<td>$(Format-Date $Item.AD_LastLogon_AllDCs)</td>
+<td>$(($Item.AD_LastLogon_AllDCs -split ' \| ' | ForEach-Object { [System.Net.WebUtility]::HtmlEncode($_) }) -join '<br>')</td>
 <td>$(Format-Date $Item.Entra_LastSuccessfulSignIn)</td>
 <td><b>$(Format-Date $Item.LastKnownActivity)</b></td>
 <td><span class="$StatusClass">$($Item.ActivityStatus)</span></td>
